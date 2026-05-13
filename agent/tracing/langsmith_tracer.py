@@ -105,31 +105,26 @@ class LangSmithTracer(Tracer):
             trace_input = {
                 "node_name": name,
                 "trace_id": trace_metadata.trace_id,
+                "conversation_id": trace_metadata.conversation_id or "",
             }
 
-            # Add optional identity fields if present
-            if trace_metadata.conversation_id:
-                trace_input["conversation_id"] = trace_metadata.conversation_id
-            if trace_metadata.user_id:
-                trace_input["user_id"] = trace_metadata.user_id
-
-            # Add structural metadata (duration, status, etc.)
             # Filter out any sensitive fields
             safe_metadata = self._filter_safe_metadata(metadata)
-            trace_input.update(safe_metadata)
 
-            # Store span information for end_span
-            # Note: Actual LangSmith client runs_tree integration happens at higher level
-            span = {
-                "trace_id": trace_metadata.trace_id,
-                "span_name": name,
-                "input": trace_input,
-                "start_time": datetime.now(),
-            }
+            # Create run in LangSmith
+            run_id = self._langsmith_client.create_run(
+                name=name,
+                run_type="chain",
+                inputs=trace_input,
+                project_name=self._project_name,
+                id=None, # Let LangSmith generate or we could use trace_metadata.trace_id if unique per span
+                extra=safe_metadata,
+                start_time=datetime.utcnow()
+            )
 
-            return span
+            return run_id
 
-        except Exception:
+        except Exception as e:
             # Tracing failure is non-fatal
             return None
 
@@ -154,8 +149,8 @@ class LangSmithTracer(Tracer):
                     self.observability_sink(
                         "span_end",
                         {
-                            "trace_id": span.get("trace_id"),
-                            "span_name": span.get("span_name"),
+                            "trace_id": "unknown",  # span handle is now just an ID or object
+                            "span_name": "unknown",
                             "status": status,
                             "duration_ms": metadata.get("duration_ms"),
                         },
@@ -166,13 +161,13 @@ class LangSmithTracer(Tracer):
             # Build safe output (no raw data)
             safe_metadata = self._filter_safe_metadata(metadata)
 
-            # Update span with execution results
-            span["status"] = status
-            span["output"] = safe_metadata
-            span["end_time"] = datetime.now()
-
-            # Note: Actual span finalization (sending to LangSmith) happens at caller level
-            # This method just prepares the span object
+            # Update run in LangSmith
+            self._langsmith_client.update_run(
+                run_id=span,  # span is the run_id returned by create_run
+                outputs=safe_metadata,
+                error=metadata.get("error_message") if status == "failure" else None,
+                end_time=datetime.utcnow()
+            )
 
         except Exception:
             # Tracing failure is non-fatal
@@ -201,16 +196,20 @@ class LangSmithTracer(Tracer):
             event_data = {
                 "event_name": name,
                 "trace_id": trace_metadata.trace_id,
-                "timestamp": datetime.now().isoformat(),
+                "conversation_id": trace_metadata.conversation_id or "",
             }
-
-            if trace_metadata.conversation_id:
-                event_data["conversation_id"] = trace_metadata.conversation_id
-
             event_data.update(safe_metadata)
 
-            # Note: Actual event logging happens at caller level
-            # This method just prepares the event object
+            # Record as a small run in LangSmith
+            self._langsmith_client.create_run(
+                name=name,
+                run_type="chain",
+                inputs=event_data,
+                outputs={"status": "recorded"},
+                project_name=self._project_name,
+                start_time=datetime.utcnow(),
+                end_time=datetime.utcnow()
+            )
 
         except Exception:
             # Tracing failure is non-fatal

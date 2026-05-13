@@ -119,6 +119,12 @@ _PERSONAL_PATTERNS: List[tuple] = [
         r"i\s+am\s+(?:a\s+|an\s+)?([A-Za-z][A-Za-z\s\-']{2,60})",
         re.IGNORECASE,
     ), "personal_fact", 0.75),
+
+    # Agent Persona/Identity (User renaming the agent)
+    (re.compile(
+        r"(?:your\s+name\s+is|you\s+are\s+called|i\s+will\s+call\s+you)\s+([A-Za-z][A-Za-z\s\-']{1,50})",
+        re.IGNORECASE,
+    ), "persona_fact", 0.95),
 ]
 
 # Sentences to skip (too short or meta-conversational)

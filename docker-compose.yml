@@ -49,7 +49,7 @@ services:
       # LLM Backend
       LLM_BACKEND: ${LLM_BACKEND:-ollama}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-phi}
       
       # STT Configuration (optional)
       STT_ENABLED: ${STT_ENABLED:-true}
@@ -69,7 +69,7 @@ services:
       STM_BACKEND: ${STM_BACKEND:-sqlite}
       
       # Long-term Memory Backend
-      LTM_BACKEND: ${LTM_BACKEND:-stub}
+      LTM_BACKEND: ${LTM_BACKEND:-qdrant}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       
@@ -95,6 +95,8 @@ services:
       EXA_CONNECTION_ID: ${EXA_CONNECTION_ID:-}
       BRAVE_CONNECTION_ID: ${BRAVE_CONNECTION_ID:-}
       LINKUP_CONNECTION_ID: ${LINKUP_CONNECTION_ID:-}
+      # SearXNG (privacy-first metasearch — free, no API key needed)
+      SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
       
       # Tracing backend
       TRACER_BACKEND: ${TRACER_BACKEND:-noop}
@@ -185,6 +187,22 @@ services:
     
     restart: unless-stopped
 
+  # =========================================================================
+  # SearXNG (Self-hosted metasearch engine for web search)
+  # =========================================================================
+  searxng:
+    image: searxng/searxng:latest
+    container_name: sam-agent-searxng
+    networks:
+      - sam_network
+    ports:
+      - "${SEARXNG_PORT:-8888}:8080"
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+    volumes:
+      - searxng_data:/etc/searxng
+    restart: unless-stopped
+
 # ============================================================================
 # Networks
 # ============================================================================
@@ -214,4 +232,8 @@ volumes:
   
   # Coqui TTS model cache
   coqui_cache:
+    driver: local
+
+  # SearXNG config storage
+  searxng_data:
     driver: local

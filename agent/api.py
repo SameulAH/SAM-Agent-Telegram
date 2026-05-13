@@ -100,6 +100,22 @@ def create_app():
         try:
             from webhook.telegram import router as telegram_router
             app.include_router(telegram_router)
+            
+            # Start Autonomous Heartbeat (Morning Messages)
+            @app.on_event("startup")
+            async def start_heartbeat():
+                import asyncio
+                from agent.intelligence.autonomous_heartbeat import AutonomousHeartbeat
+                from config import Config
+                
+                # Admin chat ID from config
+                admin_chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "903341171")
+                heartbeat = AutonomousHeartbeat(admin_chat_id)
+                
+                startup_logger = logging.getLogger("agent")
+                startup_logger.info("Main: Starting Autonomous Heartbeat background service...")
+                asyncio.create_task(heartbeat.run_forever())
+                
         except ImportError:
             pass  # Telegram text handler not available
         

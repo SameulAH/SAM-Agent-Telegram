@@ -32,7 +32,7 @@ from agent.memory import MemoryController, StubMemoryController, LongTermMemoryS
 from agent.memory_nodes import MemoryNodeManager
 from agent.tracing import Tracer, TraceMetadata, NoOpTracer
 from agent.mcp.guardrails import MCPGuardrails, GuardrailViolation
-from agent.prompting.prompt_builder import SYSTEM_PROMPT, build_prompt
+from agent.prompting.prompt_builder import SYSTEM_PROMPT, REFLECTION_PROMPT, build_prompt
 
 
 class SAMAgentOrchestrator:
@@ -70,6 +70,7 @@ class SAMAgentOrchestrator:
         "like before", "earlier", "previously", "we talked",
         "you said", "remember", "last time", "you mentioned",
         "what i said", "what you said", "as i said", "as you said",
+        "who", "what", "where", "my", "me", "he", "she", "they", "then", "since",
     })
 
     # ── Declarative-fact write patterns (Phase DMA) ───────────────────────────
@@ -86,6 +87,8 @@ class SAMAgentOrchestrator:
         re.compile(r"\bi\s+use\b", re.IGNORECASE),
         re.compile(r"\bcall\s+me\b", re.IGNORECASE),
         re.compile(r"\bmy\s+(?:birthday|birthdate)\s+is\b", re.IGNORECASE),
+        re.compile(r"\bi\s+am\s+(?:a|an)\b", re.IGNORECASE),
+        re.compile(r"\bi\s+study\b", re.IGNORECASE),
     )
 
     # ── Retrieval-intent read patterns (Phase DMA) ────────────────────────────
@@ -101,6 +104,8 @@ class SAMAgentOrchestrator:
         re.compile(r"\bdo\s+you\s+remember\b", re.IGNORECASE),
         re.compile(r"\bwhat\s+(?:is|are)\s+my\b", re.IGNORECASE),
         re.compile(r"\btell\s+me\s+(?:about\s+)?my\b", re.IGNORECASE),
+        re.compile(r"\bwho\s+am\s+i\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+is\s+my\s+name\b", re.IGNORECASE),
     )
 
     @classmethod
@@ -176,6 +181,7 @@ class SAMAgentOrchestrator:
         graph.add_node("tool_execution_node", self._tool_execution_node_wrapper)  # Phase MCP
         graph.add_node("error_router_node", self._error_router_node)
         graph.add_node("format_response_node", self._format_response_node)
+        graph.add_node("reflection_node", self._reflection_node_impl)  # Phase Consciousness
 
         # Entry point
         graph.set_entry_point("router_node")
@@ -209,7 +215,7 @@ class SAMAgentOrchestrator:
             {
                 "fact_extraction": "fact_extraction_node",
                 "memory_read": "memory_read_node",
-                "call_model": "model_call_node",
+                "call_model": "decision_logic_node",
             },
         )
         graph.add_edge("fact_extraction_node", "write_authorization_node")
@@ -218,7 +224,7 @@ class SAMAgentOrchestrator:
             self._route_from_write_authorization,
             {
                 "memory_read": "memory_read_node",
-                "call_model": "model_call_node",
+                "call_model": "decision_logic_node",
             },
         )
         graph.add_edge("memory_read_node", "decision_logic_node")
@@ -521,13 +527,20 @@ class SAMAgentOrchestrator:
         # Generate IDs if not present
         conversation_id = state.conversation_id or str(uuid4())
         trace_id = state.trace_id or str(uuid4())
-        created_at = datetime.utcnow().isoformat()
+        created_at = datetime.now().isoformat()
 
         return {
             "conversation_id": conversation_id,
             "trace_id": trace_id,
             "created_at": created_at,
             "command": None,
+            # Reset ephemeral turn-based state (Phase Hygiene)
+            "tool_context": None,
+            "tool_result": None,
+            "tool_executed": False,
+            "model_response": None,
+            "final_output": None,
+            "extracted_facts": [],
         }
 
     def _decision_logic_node(self, state: AgentState) -> Dict[str, Any]:
@@ -578,37 +591,23 @@ class SAMAgentOrchestrator:
             # LTM read after DMA memory_read_node loop-back
             if (
                 state.requires_memory_read
-                and state.long_term_memory_read_result is None
+                and state.long_term_memory_read_status is None
                 and state.long_term_memory_status == "available"
             ):
                 return {"command": "long_term_memory_read"}
 
             # ── Phase 2b: Pre-model tool routing ─────────────────────────────
+            # ── Phase 2b: Pre-model tool routing (Heuristic Intent Detection) ─────────────
             if state.tool_call_count < MCPGuardrails.MAX_TOOL_CALLS_PER_TURN:
                 query_lower = (state.preprocessing_result or state.raw_input or "").lower()
+                
+                # Heuristic patterns for real-time intent
+                has_financial = any(x in query_lower for x in ["price", "btc", "eth", "$", "coin", "stock", "market"])
                 has_freshness = any(kw in query_lower for kw in self._FRESHNESS_KEYWORDS)
-
-                if has_freshness:
+                has_info_intent = any(x in query_lower for x in ["news", "update", "happened", "weather", "score", "latest"])
+                
+                if has_financial or has_freshness or has_info_intent:
                     forced_query = state.preprocessing_result or state.raw_input
-                    try:
-                        self.tracer.record_event(
-                            name="tool_intent_detected",
-                            metadata={
-                                "query_preview": query_lower[:80],
-                                "trigger": "freshness_keyword_pre_model",
-                            },
-                            trace_metadata=trace_metadata,
-                        )
-                        self.tracer.record_event(
-                            name="forced_tool_call",
-                            metadata={
-                                "tool_name": "web_search",
-                                "reason": "freshness_keyword_no_tool_call",
-                            },
-                            trace_metadata=trace_metadata,
-                        )
-                    except Exception:
-                        pass
                     _forced_tc = {
                         "name": "web_search",
                         "arguments": {"query": forced_query},
@@ -679,11 +678,9 @@ class SAMAgentOrchestrator:
         text = (state.preprocessing_result or state.raw_input or "").strip()
 
         requires_write = self._detect_write_intent(text)
-        requires_read = self._detect_read_intent(text)
-
-        # Also honour legacy reference-signal patterns for read
-        if not requires_read and self._requires_memory_retrieval(text.lower()):
-            requires_read = True
+        
+        # Phase Humanizing: Always check memory to know 'Last interaction' time
+        requires_read = True 
 
         trace_metadata = self._create_trace_metadata(state)
         try:
@@ -707,6 +704,7 @@ class SAMAgentOrchestrator:
         return {
             "requires_memory_write": requires_write,
             "requires_memory_read": requires_read,
+            "memory_read_authorized": True, # Phase Humanizing: Always authorize the read we forced
         }
 
     def _fact_extraction_node_wrapper(self, state: AgentState) -> Dict[str, Any]:
@@ -894,39 +892,130 @@ class SAMAgentOrchestrator:
         memory_context: Optional[str] = None
         memory_context_parts = []
 
+        logger.info(f"[DEBUG STATE] LTM read result: {state.long_term_memory_read_result}")
+        logger.info(f"[DEBUG STATE] STM read result: {state.memory_read_result}")
+
         if state.long_term_memory_read_result:
             facts = state.long_term_memory_read_result.get("facts", [])
-            # Phase 8: cap at 3 facts — large memory injection slows model pass
-            facts = facts[:3]
+            # Phase 8: Ultra-Optimized (3 unique facts)
+            # 3 facts is the 'Sweet Spot' for sub-10s latency on CPU.
+            facts.reverse()
+            
+            seen_texts = set()
+            unique_facts = []
+            for f in facts:
+                content = f.get("content", "")
+                text = content.get("text", "") if isinstance(content, dict) else str(content)
+                if text not in seen_texts:
+                    seen_texts.add(text)
+                    unique_facts.append(f)
+            
+            # Phase Speed & Variety: Only top 3 facts to reduce token load and repetition
+            facts = unique_facts[:3]
+            
             if facts:
-                lines = [
-                    f"- {f.get('content', f) if isinstance(f.get('content'), str) else str(f.get('content', ''))}"
-                    for f in facts
-                    if f.get("content") or (isinstance(f, dict) and f)
-                ]
+                persona_name = "SAM"  # Default
+                lines = []
+                for f in facts:
+                    content = f.get("content", "")
+                    # Extract raw text from humanized or raw content
+                    text = content
+                    if isinstance(content, dict):
+                        text = content.get("text", str(content))
+                    elif isinstance(content, str) and content.startswith("{"):
+                        try:
+                            import ast
+                            content_dict = ast.literal_eval(content)
+                            text = content_dict.get("text", content)
+                        except Exception:
+                            pass
+                    
+                    # Detect Persona/Identity renaming
+                    # (regex to find the name in the stored fact sentence)
+                    if f.get("fact_type") == "persona_fact":
+                        import re as _re
+                        m = _re.search(r"(?:your\s+name\s+is|you\s+are\s+called|i\s+will\s+call\s+you|call\s+me)\s+([A-Za-z][A-Za-z\s\-']{1,50})", text, _re.I)
+                        if m:
+                            persona_name = m.group(1).strip()
+                    
+                    lines.append(f"- {text}")
+                
                 if lines:
                     memory_context_parts.append("Remembered facts:\n" + "\n".join(lines))
+                # Update system prompt with dynamic persona
+                system_prompt_to_use = SYSTEM_PROMPT.replace("You are SAM", f"You are {persona_name}")
+            else:
+                persona_name = state.persona_name
+                system_prompt_to_use = SYSTEM_PROMPT
+        else:
+            persona_name = state.persona_name
+            system_prompt_to_use = SYSTEM_PROMPT
 
         if state.memory_read_result:
-            # Build a human-readable prior-turn summary from STM data
-            stm_parts = []
-            prior_input = state.memory_read_result.get("raw_input")
-            prior_output = (
-                state.memory_read_result.get("final_output")
-                or state.memory_read_result.get("conversation_context")
-            )
-            if prior_input:
-                stm_parts.append(f"User previously said: {prior_input}")
-            if prior_output:
-                stm_parts.append(f"You previously answered: {prior_output}")
-            if stm_parts:
-                memory_context_parts.append("Prior conversation:\n" + "\n".join(stm_parts))
-            elif prior_output:
-                # fallback: plain context string
-                memory_context_parts.append(f"Prior conversation:\n{prior_output}")
+            # Phase Rolling Window: Build a full transcript from history
+            history = state.memory_read_result.get("history", [])
+            if not history and "last_turn" in state.memory_read_result:
+                history = [state.memory_read_result["last_turn"]]
+            elif not history and "raw_input" in state.memory_read_result:
+                history = [state.memory_read_result]
 
-        if memory_context_parts:
-            memory_context = "\n\n".join(memory_context_parts)
+            # Limit to last 3 turns
+            history = history[-3:]
+
+            stm_lines = []
+            for i, turn in enumerate(history):
+                t_input = turn.get("raw_input", "").strip()
+                t_output = turn.get("final_output", "").strip()
+                
+                # Phase Surgical: Clean the history turns before labelling them
+                import re as _re_hist
+                if t_input.lower().startswith("user:"): t_input = t_input[5:].strip()
+                if t_input.lower().startswith("sam:"): t_input = t_input[4:].strip()
+                if t_output.lower().startswith("user:"): t_output = t_output[5:].strip()
+                if t_output.lower().startswith("sam:"): t_output = t_output[4:].strip()
+                
+                # Strip internal monologue blocks from history turns
+                t_output = _re_hist.split(r"###\s*(CONTEXT|THOUGHT|REASONING)", t_output, flags=_re_hist.IGNORECASE)[0].strip()
+                t_output = _re_hist.sub(r"<thought>.*?</thought>", "", t_output, flags=_re_hist.DOTALL | _re_hist.IGNORECASE).strip()
+                
+                if t_input:
+                    stm_lines.append(f"User: {t_input}")
+                if t_output:
+                    stm_lines.append(f"SAM: {t_output}")
+            
+            if stm_lines:
+                memory_context_parts.append("\n".join(stm_lines))
+
+            # Calculate time since the ABSOLUTE LAST interaction (Phase Humanizing)
+            # We use the 'created_at' which is the database timestamp of the whole record
+            prior_time_str = state.memory_read_result.get("created_at")
+            if prior_time_str:
+                try:
+                    from datetime import datetime
+                    prior_time = datetime.fromisoformat(prior_time_str)
+                    now = datetime.now()
+                    diff = now - prior_time
+                    minutes = int(diff.total_seconds() // 60)
+                    if minutes < 60:
+                        time_str = f"{minutes} minutes ago"
+                    elif minutes < 1440:
+                        time_str = f"{minutes // 60} hours ago"
+                    else:
+                        time_str = f"{minutes // 1440} days ago"
+                    memory_context_parts.append(f"Last interaction was: {time_str}")
+                except Exception:
+                    pass
+
+            # Phase Grounding: IDENTITY IS TOP PRIORITY
+            final_parts = [
+                f"### CURRENT IDENTITY\n- Your name: SAM\n- User's name: ISMAIL",
+            ]
+            
+            # Add other parts (Time, History, Facts) in reverse order (Newest first)
+            memory_context_parts.reverse()
+            final_parts.extend(memory_context_parts)
+            
+            memory_context = "\n\n".join(final_parts)
 
         # ── Build structured prompt via PromptBuilder ─────────────────────────
         user_input = state.preprocessing_result or state.raw_input
@@ -936,6 +1025,7 @@ class SAMAgentOrchestrator:
             memory_context=memory_context,
             tool_context=state.tool_context,
         )
+        logger.info(f"--- [PROMPT DEBUG] ---\n{prompt}\n--- [END PROMPT DEBUG] ---")
 
         trace_metadata = self._create_trace_metadata(state)
 
@@ -971,7 +1061,7 @@ class SAMAgentOrchestrator:
             task="respond",
             prompt=prompt,
             context=None,   # tool_context is now embedded in prompt via build_prompt
-            timeout_s=45,
+            timeout_s=60,
             trace_id=state.trace_id,
         )
 
@@ -1015,66 +1105,7 @@ class SAMAgentOrchestrator:
         return {
             "model_response": model_response,
             "model_metadata": model_response.metadata,
-        }
-
-    def _result_handling_node(self, state: AgentState) -> Dict[str, Any]:
-        """
-        Validate and handle model output.
-        
-        Responsibility: Validate model_response, update state with output
-        
-        Rules:
-        - Must NOT call model again
-        - Must NOT access memory implicitly
-        - Model outputs are data, not control signals
-        """
-        return self._wrap_node_execution("result_handling_node", self._result_handling_node_impl, state)
-
-    def _result_handling_node_impl(self, state: AgentState) -> Dict[str, Any]:
-        """Result handling node implementation (unwrapped)."""
-        if not state.model_response:
-            raise ValueError("model_response is None in result_handling_node")
-
-        if state.model_response.status == "success" and state.model_response.output:
-            final_output = state.model_response.output
-        else:
-            # This shouldn't happen if routing is correct, but be explicit
-            final_output = None
-
-        # ── Phase 5: Output conciseness enforcement ───────────────────────────
-        if final_output:
-            original_len = len(final_output)
-            truncated = False
-
-            # Soft limit: cap at MAX_OUTPUT_SENTENCES (split on sentence endings)
-            import re as _re
-            sentences = _re.split(r"(?<=[.!?])\s+", final_output.strip())
-            if len(sentences) > self.MAX_OUTPUT_SENTENCES:
-                final_output = " ".join(sentences[: self.MAX_OUTPUT_SENTENCES]).strip()
-                truncated = True
-
-            # Hard limit: absolute character ceiling
-            if len(final_output) > self.MAX_OUTPUT_CHARS:
-                final_output = final_output[: self.MAX_OUTPUT_CHARS] + "..."
-                truncated = True
-
-            if truncated:
-                trace_metadata = self._create_trace_metadata(state)
-                try:
-                    self.tracer.record_event(
-                        name="response_truncated",
-                        metadata={
-                            "original_length": original_len,
-                            "final_length": len(final_output),
-                            "max_chars": self.MAX_OUTPUT_CHARS,
-                        },
-                        trace_metadata=trace_metadata,
-                    )
-                except Exception:
-                    pass
-
-        return {
-            "final_output": final_output,
+            "persona_name": persona_name,
         }
 
     def _error_router_node(self, state: AgentState) -> Dict[str, Any]:
@@ -1130,6 +1161,21 @@ class SAMAgentOrchestrator:
         if final_output is None and state.model_response:
             if state.model_response.status == "success" and state.model_response.output:
                 final_output = state.model_response.output
+                # Phase Surgical: Universal strip of any accidental prefixes or internal monologues
+                if final_output:
+                    # Strip prefixes
+                    prefixes = ["SAM:", "User:", "Assistant:", "Jarvis:", "Thought:"]
+                    for p in prefixes:
+                        if final_output.startswith(p):
+                            final_output = final_output[len(p):].strip()
+                            break
+                    
+                    # Strip "Internal Monologue" blocks (e.g. ### CONTEXT, <thought>, etc.)
+                    import re as _re_strip
+                    # Strip everything after and including '### CONTEXT' or similar headers if they appear at the end
+                    final_output = _re_strip.split(r"###\s*(CONTEXT|THOUGHT|REASONING)", final_output, flags=_re_strip.IGNORECASE)[0].strip()
+                    # Strip <thought> tags
+                    final_output = _re_strip.sub(r"<thought>.*?</thought>", "", final_output, flags=_re_strip.DOTALL | _re_strip.IGNORECASE).strip()
 
         # Safety fallback: model emitted a tool call again (output stripped to "") but
         # we already have tool_context — synthesize a minimal answer from context.
@@ -1175,6 +1221,85 @@ class SAMAgentOrchestrator:
         return {
             "final_output": final_output,
         }
+
+    def reflect(self, state_dict: Dict[str, Any]) -> None:
+        """
+        Run the consciousness reflection phase in the background.
+        """
+        # Filter dict to only include fields accepted by AgentState (Phase Speed Hack)
+        # LangGraph result contains extra keys (status, nodes, etc.) that would break dataclass init
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(AgentState)}
+        filtered_state = {k: v for k, v in state_dict.items() if k in valid_fields}
+        
+        state = AgentState(**filtered_state)
+        self._reflection_node_impl(state)
+
+    def _reflection_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """
+        Inner consciousness node. Reflects on the turn to extract deep insights.
+        """
+        start_time = time.time()
+        logger.info(f"reflection_node: START (trace_id={state.trace_id})")
+        
+        # Don't reflect on errors
+        if state.error_type:
+            return {"command": "end"}
+
+        # Build reflection prompt
+        reflection_input = f"User said: {state.raw_input}\nI replied: {state.final_output}"
+        
+        try:
+            # We call the model backend DIRECTLY (not through the orchestrator's model_call_node)
+            # to avoid triggering decision logic or tool detection for an internal pass.
+            # Using 120s timeout for reflection as it might be complex
+            response = self.model_backend.generate(ModelRequest(
+                task="reflection",
+                prompt=reflection_input,
+                system_prompt=REFLECTION_PROMPT,
+                timeout_s=60,
+                trace_id=state.trace_id
+            ))
+            
+            if response.status == "success":
+                # Parse JSON list from response
+                cleaned = response.output.strip()
+                # Find the JSON array
+                match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+                if match:
+                    try:
+                        insights = json.loads(match.group(0))
+                        logger.info(f"reflection_node: Extracted {len(insights)} insights")
+                        
+                        # Store in state
+                        state.reflections = insights
+                        
+                        # Write to Long-Term Memory automatically
+                        for insight in insights:
+                            fact_text = insight.get("fact", "")
+                            fact_type = insight.get("type", "reflection")
+                            conf = insight.get("confidence", 0.7)
+                            
+                            if fact_text:
+                                # We use the memory_nodes manager directly
+                                self.memory_nodes._write_long_term_fact(
+                                    state.conversation_id,
+                                    fact_text,
+                                    fact_type,
+                                    conf
+                                )
+                    except json.JSONDecodeError:
+                        logger.warning("reflection_node: Malformed JSON in output")
+                else:
+                    logger.warning("reflection_node: No JSON list found in output")
+            else:
+                logger.warning(f"reflection_node: Model failed with status {response.status}")
+
+        except Exception as e:
+            logger.error(f"reflection_node: ERROR: {str(e)}")
+
+        logger.info(f"[LATENCY] reflection_node took {time.time() - start_time:.3f}s")
+        return {"command": "end"}
 
     # ─────────────────────────────────────────────────────
     # TOOL EXECUTION NODE (Phase MCP)
@@ -1505,26 +1630,18 @@ class SAMAgentOrchestrator:
         # Run graph
         result = self.graph.invoke(initial_state)
 
-        # Extract response from format_response_node output
+        # Ensure we return the FULL state dict so reflection has all context (raw_input, etc)
+        # but also include the 'output' and 'status' keys for legacy compatibility
         if isinstance(result, dict):
-            # LangGraph returns the final state as a plain dict — map to standard shape
-            return {
-                "conversation_id": result.get("conversation_id", ""),
-                "trace_id": result.get("trace_id", ""),
-                "status": "success" if result.get("error_type") is None else "error",
-                "output": result.get("final_output"),
-                "error_type": result.get("error_type"),
-                "metadata": result.get("model_metadata") or {},
-            }
+            result["output"] = result.get("final_output")
+            result["status"] = "success" if result.get("error_type") is None else "error"
+            return result
         elif isinstance(result, AgentState):
-            # If result is state, manually format
-            return {
-                "conversation_id": result.conversation_id,
-                "trace_id": result.trace_id,
-                "status": "success" if result.error_type is None else "error",
-                "output": result.final_output,
-                "error_type": result.error_type,
-                "metadata": result.model_metadata or {},
-            }
+            # Convert AgentState to dict
+            import dataclasses
+            res_dict = dataclasses.asdict(result)
+            res_dict["output"] = result.final_output
+            res_dict["status"] = "success" if result.error_type is None else "error"
+            return res_dict
         else:
             raise TypeError(f"Unexpected result type: {type(result)}")

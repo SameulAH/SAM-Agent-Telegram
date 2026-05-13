@@ -48,6 +48,7 @@ class AgentState:
     # Output
     final_output: Optional[str] = None
     error_type: Optional[str] = None
+    persona_name: str = "SAM"  # Dynamic agent identity
 
     # Control
     command: Optional[str] = None  # preprocess | call_model | success | failure
@@ -58,6 +59,7 @@ class AgentState:
     memory_read_authorized: bool = False             # Does this execution want to read memory?
     memory_write_authorized: bool = False            # Does this execution want to write memory?
     memory_read_result: Optional[Dict[str, Any]] = None  # Data from memory read (if authorized)
+    memory_read_status: Optional[str] = None         # Status of memory read (None | success | failed | not_found)
     memory_write_status: Optional[str] = None        # Status of memory write operation
 
     # Memory: Phase 3.2 Addition (Long-term)
@@ -65,6 +67,7 @@ class AgentState:
     long_term_memory_requested: bool = False         # Should we access long-term memory?
     long_term_memory_status: str = "available"       # "available" | "unavailable"
     long_term_memory_read_result: Optional[Dict[str, Any]] = None  # Facts retrieved (if authorized)
+    long_term_memory_read_status: Optional[str] = None  # Status of long-term read (None | success | failed | not_found)
     long_term_memory_write_status: Optional[str] = None  # Status of long-term fact write
 
     # ── Deterministic Memory Intent (Phase DMA) ──────────────────────────────
@@ -92,6 +95,9 @@ class AgentState:
     tool_call: Optional[Dict[str, Any]] = None       # Pending tool call (set by model_call_node, cleared by tool_execution_node)
     tool_result: Optional[Dict[str, Any]] = None     # Raw result from tool execution
     tool_context: Optional[str] = None               # Formatted tool results for model context
+    
+    # Reflections: Learning consciousness insights
+    reflections: Optional[List[Dict[str, Any]]] = None  # Insights learned about user this turn
 
     def __post_init__(self):
         """Validate state schema."""

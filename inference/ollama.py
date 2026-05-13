@@ -212,7 +212,10 @@ class OllamaModelBackend(ModelBackend):
         }
 
         try:
-            messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+            # Use request.system_prompt if provided (Phase Consciousness), 
+            # otherwise fallback to authoritative _SYSTEM_PROMPT.
+            sys_p = request.system_prompt if request.system_prompt else _SYSTEM_PROMPT
+            messages = [{"role": "system", "content": sys_p}]
 
             # Build user message — inject tool results on second call
             if request.context:

@@ -39,6 +39,10 @@ class Config:
     # Database
     SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "./memory.db")
     
+    # Long-term Memory (Qdrant)
+    QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+    LTM_COLLECTION = os.getenv("LTM_COLLECTION", "long_term_memory")
+    
     @classmethod
     def validate(cls) -> bool:
         """Validate that required configuration is set."""

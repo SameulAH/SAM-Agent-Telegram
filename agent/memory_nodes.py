@@ -104,22 +104,26 @@ class MemoryNodeManager:
             if response.status == "success":
                 return {
                     "memory_read_result": response.data,
+                    "memory_read_status": "success",
                     "memory_available": True,
                 }
             elif response.status == "unavailable":
                 return {
                     "memory_read_result": None,
+                    "memory_read_status": "failed",
                     "memory_available": False,
                 }
             else:  # not_found, unauthorized, etc.
                 return {
                     "memory_read_result": None,
+                    "memory_read_status": "not_found",
                     "memory_available": True,
                 }
         except Exception as e:
             # Memory failure is non-fatal
             return {
                 "memory_read_result": None,
+                "memory_read_status": "failed",
                 "memory_available": False,
             }
 
@@ -164,17 +168,42 @@ class MemoryNodeManager:
             if state.model_response.status == "success" and state.model_response.output:
                 final_out = state.model_response.output
 
-        # Build request (store derived facts only)
+        # Phase Rolling Window: Maintain last 5 turns for context continuity
+        existing_history = []
+        try:
+            read_req = MemoryReadRequest(conversation_id=state.conversation_id, key="conversation_context", authorized=True)
+            read_resp = self.memory_controller.read(read_req)
+            if read_resp.status == "success" and isinstance(read_resp.data, dict):
+                # Handle legacy single-turn format or new history format
+                if "history" in read_resp.data:
+                    existing_history = read_resp.data["history"]
+                else:
+                    # Upgrade legacy single-turn to history
+                    existing_history = [read_resp.data]
+        except Exception:
+            pass
+
+        # Build current turn
+        current_turn = {
+            "raw_input": state.raw_input,
+            "final_output": final_out,
+            "interaction_timestamp": state.created_at,
+        }
+        
+        # Update history (Slide window: keep last 5)
+        new_history = existing_history + [current_turn]
+        new_history = new_history[-5:]
+
+        # Build request
         request = MemoryWriteRequest(
             conversation_id=state.conversation_id,
-            key="conversation_context",  # Default key
+            key="conversation_context",
             data={
-                "raw_input": state.raw_input,               # What the user said
-                "final_output": final_out,                  # What SAM answered
-                "interaction_timestamp": state.created_at,
+                "history": new_history,
+                "last_turn": current_turn, # Legacy compatibility
             },
             authorized=True,
-            reason="agent_storing_outcome",
+            reason="agent_storing_rolling_history",
         )
 
         # Execute write (never crashes)
@@ -269,22 +298,26 @@ class MemoryNodeManager:
                             for f in facts
                         ]
                     },
+                    "long_term_memory_read_status": "success",
                     "long_term_memory_status": "available",
                 }
             elif response.status == "unavailable":
                 return {
                     "long_term_memory_read_result": {"facts": []},  # sentinel: attempted
+                    "long_term_memory_read_status": "failed",
                     "long_term_memory_status": "unavailable",
                 }
             else:  # not_found, unauthorized, etc.
                 return {
                     "long_term_memory_read_result": {"facts": []},  # sentinel: read attempted, no facts
+                    "long_term_memory_read_status": "not_found",
                     "long_term_memory_status": "available",
                 }
         except Exception as e:
             # Long-term memory failure is non-fatal
             return {
                 "long_term_memory_read_result": {"facts": []},  # sentinel: attempted but failed
+                "long_term_memory_read_status": "failed",
                 "long_term_memory_status": "unavailable",
             }
 
@@ -399,3 +432,26 @@ class MemoryNodeManager:
                 "long_term_memory_write_status": "failed",
                 "long_term_memory_status": "unavailable",
             }
+
+    def _write_long_term_fact(self, user_id: str, text: str, fact_type: str, confidence: float = 0.8) -> bool:
+        """Helper to write a single fact to LTM (used by reflection node)."""
+        try:
+            from agent.memory import MemoryFact, LongTermMemoryWriteRequest
+            fact = MemoryFact(
+                fact_type=fact_type,
+                content={"text": text, "source": "agent_reflection"},
+                user_id=user_id,
+                confidence=confidence,
+                source="reflection_node",
+            )
+            request = LongTermMemoryWriteRequest(
+                user_id=user_id,
+                fact=fact,
+                authorized=True,
+                reason="agent_conscious_reflection",
+            )
+            response = self.long_term_memory_store.write_fact(request)
+            return response.status == "success"
+        except Exception as e:
+            logger.error(f"MemoryNodeManager: Failed to write reflection fact: {e}")
+            return False

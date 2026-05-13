@@ -133,7 +133,7 @@ class SQLiteShortTermMemoryStore(MemoryController):
 
             cursor.execute(
                 """
-                SELECT data FROM short_term_memory
+                SELECT data, created_at FROM short_term_memory
                 WHERE conversation_id = ? AND key = ?
                 """,
                 (request.conversation_id, request.key),
@@ -152,6 +152,10 @@ class SQLiteShortTermMemoryStore(MemoryController):
             # Parse JSON data
             try:
                 data = json.loads(row[0])
+                # Inject database timestamp into data for temporal awareness (Phase Humanizing)
+                if isinstance(data, dict):
+                    data["created_at"] = row[1]
+                
                 logger.debug(f"Memory read successful: {request.conversation_id}, key={request.key}")
                 return MemoryReadResponse(status="success", data=data)
             except json.JSONDecodeError as e:

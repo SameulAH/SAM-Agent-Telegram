@@ -1,4 +1,4 @@
-﻿"""
+"""
 MCP External Client — Multi-Provider Semantic Web Search.
 
 Three providers available via Smithery (priority order: Exa → Brave → Linkup):
@@ -92,6 +92,7 @@ class SearchProvider(str, Enum):
     EXA    = "exa"
     BRAVE  = "brave"
     LINKUP = "linkup"
+    SEARXNG = "searxng"
 
 
 # Static configuration per provider
@@ -117,6 +118,12 @@ _PROVIDER_CONFIG: Dict[str, Dict] = {
             "outputType": "sourcedAnswer",
             "depth":      "standard",
         },
+    },
+    SearchProvider.SEARXNG: {
+        "direct_url":  os.getenv("SEARXNG_URL", "https://searx.be"),
+        "query_param": "",
+        "tool_name":   "searxng_search",
+        "args_fn":     lambda q, n: {"q": q, "format": "json", "pageno": 1},
     },
 }
 
@@ -158,6 +165,7 @@ class MCPClient:
         exa_connection_id: Optional[str] = None,
         brave_connection_id: Optional[str] = None,
         linkup_connection_id: Optional[str] = None,
+        searxng_url: Optional[str] = None,
         # ── Backward-compat (BrowserBase era) ────────────────
         # api_key maps to exa_api_key; project_id / connection_id silently ignored
         api_key: Optional[str] = None,
@@ -179,6 +187,7 @@ class MCPClient:
         self._exa_conn    = exa_connection_id    or os.getenv("EXA_CONNECTION_ID", "")
         self._brave_conn  = brave_connection_id  or os.getenv("BRAVE_CONNECTION_ID", "")
         self._linkup_conn = linkup_connection_id or os.getenv("LINKUP_CONNECTION_ID", "")
+        self._searxng_url = searxng_url or os.getenv("SEARXNG_URL", "https://searx.be")
 
         # Resolve active provider and URL once at construction time
         self._provider = self._active_provider()
@@ -202,6 +211,8 @@ class MCPClient:
             return SearchProvider.BRAVE
         if ok(self._linkup_key) or has_proxy(self._linkup_conn):
             return SearchProvider.LINKUP
+        if ok(self._searxng_url):
+            return SearchProvider.SEARXNG
         return None
 
     def _build_url(self) -> str:
@@ -213,17 +224,21 @@ class MCPClient:
         if self._provider is None:
             return ""
 
+        # SearXNG is a direct-access provider — no API key or proxy needed
+        if self._provider == SearchProvider.SEARXNG:
+            return self._searxng_url.rstrip("/")
+
         cfg  = _PROVIDER_CONFIG[self._provider]
         conn = {
             SearchProvider.EXA:    self._exa_conn,
             SearchProvider.BRAVE:  self._brave_conn,
             SearchProvider.LINKUP: self._linkup_conn,
-        }[self._provider]
+        }.get(self._provider, "")
         key = {
             SearchProvider.EXA:    self._exa_key,
             SearchProvider.BRAVE:  self._brave_key,
             SearchProvider.LINKUP: self._linkup_key,
-        }[self._provider]
+        }.get(self._provider, "")
 
         # Prefer Smithery Connect proxy when a connection ID is available
         if conn and self._namespace and self._smithery_key:
@@ -316,10 +331,31 @@ class MCPClient:
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    self.mcp_url, json=payload, headers=self._build_headers()
-                )
+                if self._provider == SearchProvider.SEARXNG:
+                    # Native SearXNG GET request
+                    response = await client.get(
+                        f"{self.mcp_url}/search", params=arguments, headers=self._build_headers()
+                    )
+                else:
+                    # Standard MCP JSON-RPC POST request
+                    response = await client.post(
+                        self.mcp_url, json=payload, headers=self._build_headers()
+                    )
                 response.raise_for_status()
+                
+                # Handle Native SearXNG response vs MCP JSON-RPC
+                if self._provider == SearchProvider.SEARXNG:
+                    raw_data = response.json()
+                    # Convert SearXNG results to standard format
+                    search_results = []
+                    for r in raw_data.get("results", [])[:args.max_results]:
+                        search_results.append(BrowserBaseResult(
+                            title=r.get("title", "Result"),
+                            url=r.get("url", ""),
+                            snippet=r.get("content", "") or r.get("snippet", "")
+                        ))
+                    return MCPResponse(status="success", results=MCPGuardrails.sanitize_results(search_results))
+                
                 rpc_data = self._parse_response(response)
 
         except httpx.TimeoutException:

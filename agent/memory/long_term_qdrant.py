@@ -16,6 +16,7 @@ from typing import Optional, List
 from datetime import datetime
 from uuid import uuid4
 
+import logging
 from agent.memory.long_term_base import LongTermMemoryStore
 from agent.memory.long_term_types import (
     MemoryFact,
@@ -59,6 +60,7 @@ class QdrantLongTermMemoryStore(LongTermMemoryStore):
         self.vector_size = vector_size
         self._client = None
         self._embedder = None
+        self.logger = logging.getLogger(__name__)
         self._initialize()
 
     def _initialize(self) -> None:
@@ -82,11 +84,16 @@ class QdrantLongTermMemoryStore(LongTermMemoryStore):
                         distance=models.Distance.COSINE,
                     ),
                 )
+                self.logger.info(f"Qdrant collection created: {self.collection_name}")
+            else:
+                self.logger.info(f"Qdrant collection connected: {self.collection_name}")
         except ImportError:
             # qdrant-client not installed
+            self.logger.error("qdrant-client not installed")
             self._client = None
-        except Exception:
+        except Exception as e:
             # Qdrant unavailable
+            self.logger.error(f"Qdrant unavailable at {self.qdrant_url}: {str(e)}")
             self._client = None
 
     def _get_embedding(self, text: str) -> Optional[List[float]]:
@@ -202,25 +209,30 @@ class QdrantLongTermMemoryStore(LongTermMemoryStore):
                     error="Qdrant connection unavailable",
                 )
 
-            # Get embedding for query (fallback to zeros if unavailable)
-            query_embedding = self._get_embedding(
-                json.dumps({"user_id": query.user_id})
+            # Search Qdrant via scroll with filter (exact match for user_id)
+            from qdrant_client import models
+            
+            scroll_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="user_id",
+                        match=models.MatchValue(value=query.user_id),
+                    )
+                ]
             )
-
-            # Search Qdrant
-            results = self._client.search(
+            
+            results, _ = self._client.scroll(
                 collection_name=self.collection_name,
-                query_vector=query_embedding,
+                scroll_filter=scroll_filter,
                 limit=query.limit,
+                with_payload=True,
+                with_vectors=False,
             )
 
             # Extract facts from results
             facts = []
             for result in results:
                 payload = result.payload
-                # Filter by user_id
-                if payload.get("user_id") != query.user_id:
-                    continue
                 # Filter by fact_type if specified
                 if query.fact_types and payload.get("fact_type") not in query.fact_types:
                     continue

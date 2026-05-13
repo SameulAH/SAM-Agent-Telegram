@@ -85,17 +85,28 @@ class SAMOrchestrator:
     async def invoke(self, raw_input: str, conversation_id: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Execute a single agent invocation.
-        
-        Args:
-            raw_input: Raw input to process (text, audio reference, or image reference)
-            conversation_id: Optional conversation ID (generated if not provided)
-            trace_id: Optional trace ID (generated if not provided)
-            
-        Returns:
-            Response dict with conversation_id, trace_id, status, output, error_type, metadata
         """
-        return await self.langgraph_orchestrator.invoke(
+        import asyncio
+        
+        # Execute main conversation graph
+        result = await self.langgraph_orchestrator.invoke(
             raw_input=raw_input,
             conversation_id=conversation_id,
             trace_id=trace_id,
         )
+        
+        # ── Consciousness Reflection (Background) ─────────────────────────────
+        # Trigger deep reflection after a short delay so it doesn't hog CPU during the reply.
+        async def delayed_reflect():
+            await asyncio.sleep(5)  # Let the response settle
+            try:
+                await asyncio.to_thread(self.langgraph_orchestrator.reflect, result)
+            except Exception as e:
+                logger.warning(f"Failed to run reflection: {e}")
+
+        try:
+            asyncio.create_task(delayed_reflect())
+        except Exception as e:
+            logger.warning(f"Failed to start background reflection task: {e}")
+            
+        return result
