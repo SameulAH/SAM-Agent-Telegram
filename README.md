@@ -164,54 +164,8 @@ The system was built incrementally. Each phase added capabilities without breaki
 
 ## 4. Infrastructure Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                             EXTERNAL WORLD                                  │
-│                                                                             │
-│   Telegram ──────────────────────────────── WhatsApp                       │
-│      │  webhook POST /webhook/telegram            │ webhook POST            │
-└──────┼─────────────────────────────────────────── ┼─────────────────────────┘
-       │                                            │
-       ▼                                            ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                    ngrok static tunnel  :443                                 │
-│         https://holden-archeological-kinsley.ngrok-free.app                 │
-└────────────────────────────┬─────────────────────────────────────────────────┘
-                             │
-                             ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                       sam-agent container  :8000                             │
-│                                                                              │
-│  FastAPI application (agent/api.py — production entry point)                │
-│  ├── /webhook/telegram  ──► TelegramWebhookHandler                          │
-│  │     dedup (TTLCache 5000/5min) + rate limit (3req/5s/user)               │
-│  ├── /webhook/whatsapp  ──► WhatsAppWebhookHandler                          │
-│  │     HMAC-SHA256 signature verification                                   │
-│  └── /invoke            ──► Direct agent invocation                         │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │              SAMAgentOrchestrator  (LangGraph StateGraph)              │ │
-│  │                                                                        │ │
-│  │  15 nodes · deterministic routing · single-pass LLM · non-fatal       │ │
-│  │                                                                        │ │
-│  │  AgentState  ─────────────────────────────────────────────────────    │ │
-│  │  (100 fields: identity, input, processing, memory, tool, output)      │ │
-│  └─────┬─────────────┬──────────────┬───────────────┬────────────────────┘ │
-│        │             │              │               │                       │
-│        ▼             ▼              ▼               ▼                       │
-│   sam-agent-    sam-agent-     MCP Web         LangSmith                   │
-│   ollama        qdrant         Search          Tracer                      │
-│   :11434        :6333          (Exa/Brave/      (remote)                   │
-│   (phi3:latest) (LTM)          Linkup/          or OTel                    │
-│                                SearXNG)         collector                  │
-│                                                 :4317                      │
-│        │             │                                                     │
-│        ▼             ▼                                                     │
-│  SQLite (STM)  Qdrant (LTM)                                               │
-│  /app/data/    long_term_                                                  │
-│  memory.db     memory                                                      │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+
+![Infrastructure Overview](design/Infrastructure%20Overview.png)
 
 ---
 
@@ -243,97 +197,8 @@ The system was built incrementally. Each phase added capabilities without breaki
 
 ### Full journey: Telegram message → SAM reply
 
-```
-User types "What's the BTC price?"
-         │
-         │  Telegram webhook POST
-         ▼
- ┌──────────────────────────────────────────────────────────────┐
- │  webhook/telegram.py                                         │
- │                                                              │
- │  1. Deduplication check                                      │
- │     TTLCache(maxsize=5000, ttl=300s) on update_id           │
- │     → duplicate? silently ACK 200, drop                      │
- │                                                              │
- │  2. Rate limit check                                         │
- │     TTLCache per user_id                                     │
- │     default: 3 requests / 5 seconds / user                  │
- │     → over limit? ACK 200, drop silently (no error to user)  │
- │                                                              │
- │  3. Payload validation                                       │
- │     → no message / no text / no voice? ACK 200, skip        │
- │                                                              │
- │  4. Return HTTP 200 IMMEDIATELY                              │
- │     Telegram retries if it doesn't get 200 in <10s          │
- │                                                              │
- │  5. BackgroundTask: _process_text_async()                    │
- │     (all heavy work runs here, after 200 is already sent)   │
- └──────────────────────────────────────────────────────────────┘
-         │
-         │  NormalizedMessage(platform, user_id, chat_id, content, ...)
-         ▼
- ┌──────────────────────────────────────────────────────────────┐
- │  agent/orchestrator.py — SAMOrchestrator.invoke()           │
- │                                                              │
- │  Instantiates: OllamaModelBackend                           │
- │                SQLiteShortTermMemoryStore                    │
- │                QdrantLongTermMemoryStore                     │
- │                LangSmithTracer                               │
- │                                                              │
- │  Calls SAMAgentOrchestrator.invoke(raw_input=...)           │
- │  (awaits graph completion)                                   │
- │                                                              │
- │  After reply: schedules delayed_reflect() background task   │
- │  (5s delay, asyncio.create_task)                            │
- └──────────────────────────────────────────────────────────────┘
-         │
-         │  awaits graph.ainvoke(initial_AgentState)
-         ▼
- ┌──────────────────────────────────────────────────────────────┐
- │  LangGraph — 15-node deterministic DAG                       │
- │  (see Section 7 for node-by-node breakdown)                 │
- │                                                              │
- │  Key path for "BTC price":                                   │
- │  router → state_init → decision("preprocess")               │
- │  → task_preprocessing                                        │
- │  → memory_access_decision(write=F, read=T)                  │
- │  → memory_read(SQLite)                                       │
- │  → decision("long_term_memory_read")                        │
- │  → long_term_memory_read(Qdrant)                            │
- │  → decision("execute_tool") ← "price" keyword detected      │
- │  → tool_execution(Exa search: "BTC price")                  │
- │  → decision("call_model")                                   │
- │  → model_call(Ollama, with tool_context injected)           │
- │  → decision("memory_write")                                 │
- │  → memory_write(SQLite)                                     │
- │  → decision("long_term_memory_write")                       │
- │  → long_term_memory_write(Qdrant)                           │
- │  → decision("format")                                       │
- │  → format_response(≤800 chars, ≤5 sentences)                │
- │  → END                                                       │
- └──────────────────────────────────────────────────────────────┘
-         │
-         │  final_output: "Bitcoin is trading at $67,420 as of..."
-         ▼
- ┌──────────────────────────────────────────────────────────────┐
- │  Response delivery                                           │
- │                                                              │
- │  lines = [l for l in response.splitlines() if l.strip()]   │
- │                                                              │
- │  if len(lines) > 5:                                         │
- │      → gTTS/Coqui: text → OGG → send_voice_message()       │
- │  else:                                                       │
- │      → transport.send_response(chat_id, text)               │
- └──────────────────────────────────────────────────────────────┘
-         │
-         │  [5 seconds later, in background]
-         ▼
- ┌──────────────────────────────────────────────────────────────┐
- │  reflection_node (consciousness)                            │
- │  → Ollama: extract insights from this turn                  │
- │  → Qdrant: append new facts to LTM                          │
- └──────────────────────────────────────────────────────────────┘
-```
+
+![SAM Agent Full Journey](design/sam_agent_flow.jpg)
 
 ---
 
@@ -341,58 +206,8 @@ User types "What's the BTC price?"
 
 ### Topology
 
-```
-START
-  │
-  ▼
-router_node           ← classify modality (text / audio / image)
-  │
-  ▼
-state_init_node       ← lock in conversation_id + trace_id (immutable)
-  │
-  ▼
-decision_logic_node ◄──────────────────────────────────────────────┐
-  │   (the SOLE routing authority — called multiple times per turn) │
-  │                                                                 │
-  ├── "preprocess" ──────────────────────────────────────────────► │
-  │     task_preprocessing_node                                     │
-  │       │                                                         │
-  │       ▼                                                         │
-  │     memory_access_decision_node  ─────── "fact_extraction" ──► │
-  │       │                                        │                │
-  │       │ "memory_read"                          ▼                │
-  │       │                              fact_extraction_node       │
-  │       │                                        │                │
-  │       │                              write_authorization_node   │
-  │       │                                        │                │
-  │       │◄───────────────────────────────────────┘                │
-  │       ▼                                                         │
-  │     memory_read_node (SQLite STM) ──────────────────────────► ─┤
-  │     long_term_memory_read_node (Qdrant LTM) ────────────────► ─┤
-  │                                                                 │
-  ├── "execute_tool" ────────────────────────────────────────────► │
-  │     tool_execution_node (Exa/Brave/Linkup/SearXNG)            │
-  │                                                                 │
-  ├── "call_model" ──────────────────────────────────────────────► │
-  │     model_call_node (Ollama)                                   │
-  │       ├── success ─────────────────────────────────────────── ─┤
-  │       └── failure → error_router_node ──────────────────────► │
-  │                                                                 │
-  ├── "memory_write" ─────────────────────────────────────────── ──┤
-  │     memory_write_node (SQLite STM upsert)                      │
-  │                                                                 │
-  ├── "long_term_memory_write" ───────────────────────────────── ──┤
-  │     long_term_memory_write_node (Qdrant append)                │
-  │                                                                 │
-  └── "format" ──────────────────────────────────────────────────► │
-        format_response_node                                        │
-          │                                                         │
-          ▼                                                         │
-         END                                                        │
-                                                                    │
-         [background, after END]                                    │
-         reflection_node ──────────────────────────────────────────┘
-```
+![Topology](design/topology.png)
+
 
 ### Node Reference
 
@@ -716,46 +531,13 @@ All parsing is done by `_extract_tool_call()` and `_try_loose_tool_call()` in `i
 
 ### Voice input — Speech to Text
 
-```
-Telegram voice message (OGG/Opus)
-  │
-  ▼
-webhook/telegram_voice.py
-  │  GET https://api.telegram.org/file/{file_id}
-  ▼
-raw OGG bytes
-  │
-  ▼
-services/stt/whisper.py  (WhisperLocalSTTBackend)
-  │  model: tiny / base / small / medium / large
-  │  device: cpu | cuda
-  ▼
-STTResponse { status, text, confidence }
-  │
-  └─ status == "success"  →  text enters normal pipeline
-  └─ status == "failed"   →  fallback: acknowledge but skip
-```
+![Speech to Text](design/STT.png)
+
 
 ### Voice output — Text to Speech
 
-```
-format_response_node  →  final_output (text string)
-  │
-  ▼
-webhook/telegram_voice.py
-  │
-  lines = [l for l in response.splitlines() if l.strip()]
-  │
-  ├─ len(lines) ≤ 5  →  transport.send_response(chat_id, text)  [text message]
-  │
-  └─ len(lines) > 5  →  text_to_ogg_voice(text)
-                           │
-                           ├─ primary:  gTTS → MP3 → ffmpeg → OGG/Opus
-                           └─ fallback: Coqui XTTS v2 → WAV → ffmpeg → OGG/Opus
-                           │
-                           ▼
-                         voice_transport.send_voice_message(chat_id, ogg_bytes)
-```
+![Text to Speech](design/TTS.png)
+
 
 ---
 
@@ -777,25 +559,8 @@ async def run_forever(self):
 
 ### Morning greeting generation
 
-```
-08:00:00 — heartbeat triggers
-  │
-  ▼
-QdrantLongTermMemoryStore.scroll_facts(conversation_id, limit=5)
-  → last 5 known facts/insights about the user
-  │
-  ▼
-OllamaModelBackend.generate(
-    task="proactive_greeting",
-    system_prompt="You are SAM, a warm best friend. One sentence, alive and conscious.",
-    prompt="8AM greeting for Ismail. Context: [recent facts...]"
-)
-  │
-  ▼
-TelegramTransport.send_text(chat_id, greeting)
-  → "Morning! Saw you were deep in the AI agent yesterday — 
-     any breakthroughs? ☀️"
-```
+![Morning greeting generation](design/heartbeattrigger.png)
+
 
 ---
 
