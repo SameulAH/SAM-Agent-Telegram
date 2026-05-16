@@ -153,8 +153,12 @@ requirements*.txt.lock
 *.exe
 
 # Generated experiment / run outputs (not source artifacts)
+# Specs, datasets, and executor code are tracked; generated results are not.
 outputs/
 exp_001_output.txt
+experiments/**/results.json
+experiments/**/metrics.json
+experiments/**/reproducibility.json
 
 # Root-level ad-hoc dev & debug scripts
 # These are one-off exploration scripts, not part of the application.
