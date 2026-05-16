@@ -160,6 +160,9 @@ experiments/**/results.json
 experiments/**/metrics.json
 experiments/**/reproducibility.json
 
+# Markdown documentation files
+*.md
+
 # Root-level ad-hoc dev & debug scripts
 # These are one-off exploration scripts, not part of the application.
 # Application tests live in tests/.
