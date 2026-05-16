@@ -13,6 +13,8 @@ Update Flow:
 """
 
 import logging
+import os
+import time
 from typing import Dict, Optional, Any
 from datetime import datetime
 
@@ -35,6 +37,28 @@ router = APIRouter(prefix="/webhook", tags=["webhook"])
 # TTL cache for update_id deduplication — 5-minute window, max 5 000 entries.
 # Prevents duplicate processing when Telegram retries a slow webhook.
 _processed_updates: TTLCache = TTLCache(maxsize=5000, ttl=300)
+
+# ── Per-user rate limiting ─────────────────────────────────────────────────────
+# Allow at most RATE_LIMIT_MAX_CALLS requests per user within RATE_LIMIT_WINDOW_S seconds.
+# Configurable via env vars; defaults are generous for a personal assistant.
+_RATE_LIMIT_WINDOW_S: int = int(os.getenv("RATE_LIMIT_WINDOW_S", "5"))
+_RATE_LIMIT_MAX_CALLS: int = int(os.getenv("RATE_LIMIT_MAX_CALLS", "3"))
+
+# Maps user_id → list of timestamps of recent requests (within the window)
+_user_request_times: TTLCache = TTLCache(maxsize=2000, ttl=_RATE_LIMIT_WINDOW_S)
+
+
+def _is_rate_limited(user_id: int) -> bool:
+    """Return True if this user has exceeded the per-window call limit."""
+    now = time.monotonic()
+    timestamps: list = _user_request_times.get(user_id, [])
+    # Prune timestamps outside the current window
+    timestamps = [t for t in timestamps if now - t < _RATE_LIMIT_WINDOW_S]
+    if len(timestamps) >= _RATE_LIMIT_MAX_CALLS:
+        return True
+    timestamps.append(now)
+    _user_request_times[user_id] = timestamps
+    return False
 
 # Telegram update structure
 class TelegramUser(BaseModel):
@@ -115,15 +139,25 @@ async def telegram_webhook(update: TelegramUpdate, background_tasks: BackgroundT
             logger.warning(f"Update {update.update_id} has no message")
             return {"status": "ok"}
 
+        # ── 3. Per-user rate limiting ─────────────────────────────────────────
+        user_id = update.message.from_.id
+        if _is_rate_limited(user_id):
+            logger.warning(
+                f"Rate limit exceeded for user_id={user_id}, update_id={update.update_id}"
+            )
+            # Always return 200 to Telegram — dropping silently is intentional
+            # (sending a reply here would itself spam the user under flood conditions)
+            return {"status": "ok"}
+
         msg = update.message
 
-        # ── 3. Route voice messages to the voice handler ──────────────────────
+        # ── 4. Route voice messages to the voice handler ──────────────────────
         if msg.voice:
             from webhook.telegram_voice import handle_voice_message
             logger.info("Voice message detected, forwarding to voice handler")
             return await handle_voice_message(update, background_tasks)
 
-        # ── 4. Skip non-text messages ─────────────────────────────────────────
+        # ── 5. Skip non-text messages ─────────────────────────────────────────
         if not msg.text:
             logger.debug(f"Message {msg.message_id} has no text or voice, skipping")
             return {"status": "ok"}
@@ -133,7 +167,7 @@ async def telegram_webhook(update: TelegramUpdate, background_tasks: BackgroundT
             f"{msg.text[:50]}"
         )
 
-        # ── 5. Offload to background — return 200 immediately ─────────────────
+        # ── 6. Offload to background — return 200 immediately ─────────────────
         background_tasks.add_task(
             _process_text_async,
             chat_id=msg.chat.id,

@@ -42,7 +42,21 @@ class Config:
     # Long-term Memory (Qdrant)
     QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
     LTM_COLLECTION = os.getenv("LTM_COLLECTION", "long_term_memory")
-    
+
+    # Security
+    # Comma-separated list of allowed CORS origins.
+    # Set to "*" only for local dev; restrict in production.
+    # Example: ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+    ALLOWED_ORIGINS: list = [
+        o.strip()
+        for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")
+        if o.strip()
+    ]
+
+    # Token required in X-Debug-Token header to access /debug/* endpoints.
+    # Leave empty to disable all debug endpoints regardless of LOCAL_OBSERVABILITY_ENABLED.
+    DEBUG_API_TOKEN: str = os.getenv("DEBUG_API_TOKEN", "")
+
     @classmethod
     def validate(cls) -> bool:
         """Validate that required configuration is set."""

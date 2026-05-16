@@ -28,7 +28,7 @@ def get_tracer_backend() -> str:
     backend = os.getenv("TRACER_BACKEND", "noop").lower().strip()
 
     # Validate backend
-    valid_backends = {"noop", "langsmith", "langtrace"}
+    valid_backends = {"noop", "langsmith", "langtrace", "otel"}
     if backend not in valid_backends:
         # Unknown backend, default to noop
         return "noop"
@@ -47,15 +47,8 @@ def create_tracer(observability_sink=None) -> Tracer:
         Tracer instance (never None, defaults to NoOpTracer)
 
     Environment Variables:
-        TRACER_BACKEND: "noop" (default), "langsmith", or "langtrace"
-        LANGSMITH_ENABLED: "true"/"false" (optional, for legacy support)
-        LANGSMITH_API_KEY: Required for LangSmith backend
-        LANGSMITH_PROJECT: Optional, defaults to "sam-agent"
-
-    Behavior:
-        - Always returns a valid Tracer instance
-        - Failures gracefully downgrade to NoOpTracer
-        - No exceptions raised
+        TRACER_BACKEND: "noop" (default), "langsmith", "langtrace", or "otel"
+        OTEL_EXPORTER_OTLP_ENDPOINT: Defaults to http://otel-collector:4317
     """
     backend = get_tracer_backend()
 
@@ -66,6 +59,11 @@ def create_tracer(observability_sink=None) -> Tracer:
         if backend == "langsmith" or (backend == "noop" and langsmith_enabled):
             # Try LangSmith if explicitly selected or if legacy flag is set
             return LangSmithTracer(enabled=True, observability_sink=observability_sink)
+
+        elif backend == "otel":
+            from agent.tracing.otel_tracer import OtelTracer
+            endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+            return OtelTracer(endpoint=endpoint, observability_sink=observability_sink)
 
         elif backend == "langtrace":
             # Langtrace backend (currently a no-op placeholder)

@@ -31,6 +31,7 @@ from agent.state_schema import AgentState
 from agent.memory import MemoryController, StubMemoryController, LongTermMemoryStore, StubLongTermMemoryStore
 from agent.memory_nodes import MemoryNodeManager
 from agent.tracing import Tracer, TraceMetadata, NoOpTracer
+from agent.observability.context import AgentExecutionContext
 from agent.mcp.guardrails import MCPGuardrails, GuardrailViolation
 from agent.prompting.prompt_builder import SYSTEM_PROMPT, REFLECTION_PROMPT, build_prompt
 
@@ -65,13 +66,17 @@ class SAMAgentOrchestrator:
     # ── Reference patterns that signal conversational back-references ─────────
     # When detected, STM + LTM context is retrieved before the model call so
     # the agent can ground its response in prior conversation history.
-    _REFERENCE_PATTERNS: frozenset = frozenset({
-        "that", "it", "this", "one day", "as we discussed",
-        "like before", "earlier", "previously", "we talked",
-        "you said", "remember", "last time", "you mentioned",
-        "what i said", "what you said", "as i said", "as you said",
-        "who", "what", "where", "my", "me", "he", "she", "they", "then", "since",
-    })
+    # Precompiled once at class definition — avoids re-compiling on every call.
+    _REFERENCE_PATTERNS: tuple = tuple(
+        re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE)
+        for kw in (
+            "that", "it", "this", "one day", "as we discussed",
+            "like before", "earlier", "previously", "we talked",
+            "you said", "remember", "last time", "you mentioned",
+            "what i said", "what you said", "as i said", "as you said",
+            "who", "what", "where", "my", "me", "he", "she", "they", "then", "since",
+        )
+    )
 
     # ── Declarative-fact write patterns (Phase DMA) ───────────────────────────
     # Trigger requires_memory_write=True when matched (rule-based, zero LLM cost).
@@ -112,13 +117,10 @@ class SAMAgentOrchestrator:
     def _requires_memory_retrieval(cls, text: str) -> bool:
         """Return True if text contains a conversational back-reference signal.
 
-        Uses word-boundary regex to avoid false positives from substrings
-        (e.g. 'that' inside 'capital of France').
+        All patterns are precompiled at class definition (word-boundary anchored)
+        to avoid per-call compilation overhead.
         """
-        for pat in cls._REFERENCE_PATTERNS:
-            if re.search(r"\b" + re.escape(pat) + r"\b", text):
-                return True
-        return False
+        return any(pat.search(text) for pat in cls._REFERENCE_PATTERNS)
 
     @classmethod
     def _detect_write_intent(cls, text: str) -> bool:
@@ -151,6 +153,11 @@ class SAMAgentOrchestrator:
         self.long_term_memory_store = long_term_memory_store or StubLongTermMemoryStore()
         self.tracer = tracer or NoOpTracer()
         self.memory_nodes = MemoryNodeManager(self.memory_controller, self.long_term_memory_store)
+        
+        # Initialize invariant alarm system with the current tracer
+        from agent.tracing.alarms import InvariantAlarmSystem
+        self.alarms = InvariantAlarmSystem(tracer=self.tracer)
+        
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -324,8 +331,12 @@ class SAMAgentOrchestrator:
         Tracing failures are silent and non-blocking.
         """
         trace_metadata = self._create_trace_metadata(state)
+        exec_context = state.execution_context
         span = None
         start_time = time.time()
+
+        if exec_context:
+            exec_context.start_node(node_name)
 
         # Node entry span
         try:
@@ -339,10 +350,51 @@ class SAMAgentOrchestrator:
             pass
 
         try:
+            # Capture state before execution for mutation detection.
+            # Exclude `execution_context` — it holds the tracer (threading locks,
+            # HTTP sessions) which cannot be deepcopied, and it is already skipped
+            # during comparison below anyway.
+            import dataclasses as _dc
+            import copy as _copy
+            _EXCLUDED_FROM_MUTATION_CHECK = frozenset({"execution_context"})
+
+            def _snapshot(s: AgentState) -> dict:
+                return {
+                    f.name: _copy.deepcopy(getattr(s, f.name))
+                    for f in _dc.fields(s)
+                    if f.name not in _EXCLUDED_FROM_MUTATION_CHECK
+                }
+
+            state_before = _snapshot(state)
+
             # Execute node
             result = node_fn(state)
             duration_s = time.time() - start_time
             duration_ms = duration_s * 1000
+
+            # Detect mutations
+            state_after = _snapshot(state)
+            mutated_fields = []
+            for field_name, value_before in state_before.items():
+                value_after = state_after.get(field_name)
+                if value_before != value_after:
+                    mutated_fields.append(field_name)
+            
+            if mutated_fields:
+                try:
+                    self.alarms.detect_state_mutation_outside_allowed_nodes(
+                        trace_id=state.trace_id,
+                        node_name=node_name,
+                        fields_mutated=mutated_fields
+                    )
+                    if exec_context:
+                        for field in mutated_fields:
+                            exec_context.record_state_violation(node_name, field, f"Mutation detected in {field}")
+                except Exception:
+                    pass
+
+            if exec_context:
+                exec_context.end_node(node_name, status="success")
 
             # ── Phase 1: mandatory latency log ────────────────────────────
             logger.info(f"[LATENCY] {node_name} took {duration_s:.3f}s")
@@ -376,6 +428,9 @@ class SAMAgentOrchestrator:
             # Exception handling (node failure)
             duration_s = time.time() - start_time
             duration_ms = duration_s * 1000
+
+            if exec_context:
+                exec_context.end_node(node_name, status="error", error_type=type(e).__name__)
 
             # ── Phase 1: mandatory latency log (failure path) ─────────────
             logger.info(f"[LATENCY] {node_name} FAILED after {duration_s:.3f}s ({type(e).__name__})")
@@ -1098,9 +1153,18 @@ class SAMAgentOrchestrator:
             # Tracing failure is non-fatal
             pass
 
-        # ── Tool call detection removed (single-model-pass architecture) ──────
-        # model_call_node no longer detects or routes to tools.
-        # decision_logic_node handles all tool routing BEFORE the model call.
+        # Record reasoning event if this is a synthesis pass (post-tool)
+        if state.execution_context:
+            if state.tool_executed:
+                state.execution_context.record_reasoning("synthesis", {
+                    "thought": "Synthesizing tool results into final response",
+                    "observation": "Tool results available in tool_context"
+                })
+            else:
+                state.execution_context.record_reasoning("before_model", {
+                    "thought": "Generating initial response",
+                    "has_memory_context": state.memory_read_result is not None
+                })
 
         return {
             "model_response": model_response,
@@ -1411,6 +1475,15 @@ class SAMAgentOrchestrator:
         tool_result_dict: Dict[str, Any] = {}
         tool_context: Optional[str] = None
 
+        if state.execution_context:
+            state.execution_context.record_reasoning("before_tool", {
+                "thought": f"Executing tool {tool_name} with arguments",
+                "tool_requested": True,
+                "tool_name": tool_name,
+                "tool_authorized": True,
+                "tool_call_count": state.tool_call_count
+            })
+
         try:
             from agent.intelligence.tools import get_tool_registry  # noqa: PLC0415
             from agent.tools.web_search_tool import WebSearchTool    # noqa: PLC0415
@@ -1447,14 +1520,19 @@ class SAMAgentOrchestrator:
                 ]
                 tool_context = MCPGuardrails.format_tool_context(result_objects)
 
-            # Fallback: if tool returned no usable results, give model a notice
-            # so it answers from training knowledge rather than repeating the tool call
             if not tool_context:
                 tool_context = (
                     "Note: The web search did not return usable results. "
                     "Please answer based on your training knowledge and state that "
                     "you could not retrieve live results."
                 )
+
+            if state.execution_context:
+                state.execution_context.record_reasoning("after_tool", {
+                    "observation": f"Tool {tool_name} returned {len(tool_result.data.get('results', []))} results" if tool_result.success else "Tool execution failed",
+                    "synthesis_pass": True,
+                    "tool_result_received": tool_result.success
+                })
 
             try:
                 self.tracer.record_event(
@@ -1619,16 +1697,56 @@ class SAMAgentOrchestrator:
         Returns:
             Response dict with conversation_id, trace_id, status, output, etc.
         """
+        conv_id = conversation_id or str(uuid4())
+        trc_id = trace_id or str(uuid4())
+        
+        # Initialize execution context for telemetry
+        exec_context = AgentExecutionContext(
+            trace_id=trc_id,
+            conversation_id=conv_id,
+            telemetry_emitter=self.tracer
+        )
+
         initial_state = AgentState(
-            conversation_id=conversation_id or str(uuid4()),
-            trace_id=trace_id or str(uuid4()),
+            conversation_id=conv_id,
+            trace_id=trc_id,
             created_at="",
             input_type="text",
             raw_input=raw_input,
+            execution_context=exec_context
         )
 
-        # Run graph
-        result = self.graph.invoke(initial_state)
+        # Run graph within a root trace span
+        root_span = None
+        try:
+            root_span = self.tracer.start_span(
+                name="agent_request",
+                metadata={"raw_input": raw_input},
+                trace_metadata=TraceMetadata(trace_id=trc_id, conversation_id=conv_id)
+            )
+        except Exception:
+            pass
+
+        try:
+            # Use ainvoke (async) rather than invoke (sync) so LangGraph runs the
+            # graph in the event loop via asyncio.to_thread for each sync node,
+            # instead of wrapping the whole graph in a thread-pool executor that
+            # requires pickling the orchestrator's non-serialisable objects
+            # (SQLite connections, threading locks, etc.).
+            result = await self.graph.ainvoke(initial_state)
+
+            if root_span:
+                try:
+                    self.tracer.end_span(span=root_span, status="success", metadata={})
+                except Exception:
+                    pass
+        except Exception as e:
+            if root_span:
+                try:
+                    self.tracer.end_span(span=root_span, status="error", metadata={"error": str(e)})
+                except Exception:
+                    pass
+            raise
 
         # Ensure we return the FULL state dict so reflection has all context (raw_input, etc)
         # but also include the 'output' and 'status' keys for legacy compatibility

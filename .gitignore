@@ -1,6 +1,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+**/__pycache__/
 *.py[cod]
+*.pyo
 *$py.class
 
 # C extensions
@@ -118,6 +120,15 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# Ruff linter cache
+.ruff_cache/
+
+# uv package manager
+.uv/
+
+# pip-compile / pip-tools
+requirements*.txt.lock
+
 # IDE
 .vscode/
 .idea/
@@ -133,5 +144,36 @@ dmypy.json
 # Temporary files
 *.tmp
 *.bak
-# Markdown files
-*.md
+
+# ============================================================================
+# SAM-Agent project-specific ignores
+# ============================================================================
+
+# Binary executables (ngrok tunnel, etc.)
+*.exe
+
+# Generated experiment / run outputs (not source artifacts)
+outputs/
+exp_001_output.txt
+
+# Root-level ad-hoc dev & debug scripts
+# These are one-off exploration scripts, not part of the application.
+# Application tests live in tests/.
+check_memory_db.py
+interact.py
+phase3_trace_test.py
+populate_memory.py
+show_results.py
+stm_check.py
+stm_e2e_test.py
+test_memory.py
+test_routes.py
+test_searxng.py
+validate_langsmith.py
+validate_observability.py
+verify_memory_system.py
+verify_skeleton.py
+
+# Runtime data
+data/
+*.db

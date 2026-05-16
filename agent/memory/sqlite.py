@@ -28,6 +28,7 @@ Data NEVER stored:
 import sqlite3
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 from agent.memory.base import MemoryController
@@ -35,6 +36,10 @@ from agent.memory.types import MemoryReadRequest, MemoryReadResponse, MemoryWrit
 
 # Get logger for memory operations
 logger = logging.getLogger(__name__)
+
+# Evict STM entries not touched within this many seconds.
+# Configurable via STM_TTL_SECONDS env var; defaults to 7 days.
+_STM_TTL_SECONDS: int = int(os.getenv("STM_TTL_SECONDS", str(7 * 24 * 3600)))
 
 
 class SQLiteShortTermMemoryStore(MemoryController):
@@ -211,11 +216,14 @@ class SQLiteShortTermMemoryStore(MemoryController):
                 """
                 INSERT INTO short_term_memory (conversation_id, key, data)
                 VALUES (?, ?, ?)
-                ON CONFLICT(conversation_id, key) 
+                ON CONFLICT(conversation_id, key)
                 DO UPDATE SET data = excluded.data, updated_at = CURRENT_TIMESTAMP
                 """,
                 (request.conversation_id, request.key, data_json),
             )
+
+            # Evict entries older than STM_TTL_SECONDS (non-fatal, inside same txn)
+            self._evict_old_entries(conn)
 
             # Explicit commit for durability
             conn.commit()
@@ -245,6 +253,23 @@ class SQLiteShortTermMemoryStore(MemoryController):
                 status="failed",
                 error=f"Memory write failed: {str(e)}",
             )
+
+    def _evict_old_entries(self, conn: sqlite3.Connection) -> None:
+        """Delete STM rows not updated within _STM_TTL_SECONDS.
+
+        Called inside an existing write transaction so no extra commit is needed.
+        Non-fatal: silently skipped on any error.
+        """
+        try:
+            conn.execute(
+                """
+                DELETE FROM short_term_memory
+                WHERE (strftime('%s', 'now') - strftime('%s', updated_at)) > ?
+                """,
+                (_STM_TTL_SECONDS,),
+            )
+        except Exception as e:
+            logger.debug("STM eviction skipped: %s", e)
 
     def clear_conversation(self, conversation_id: str) -> bool:
         """

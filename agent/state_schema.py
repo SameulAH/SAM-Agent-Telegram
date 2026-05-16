@@ -98,6 +98,10 @@ class AgentState:
     
     # Reflections: Learning consciousness insights
     reflections: Optional[List[Dict[str, Any]]] = None  # Insights learned about user this turn
+    
+    # ── Observability (Phase Additive) ────────────────────────────────────────
+    # Request-scoped execution context for telemetry and tracing.
+    execution_context: Optional[Any] = None
 
     def __post_init__(self):
         """Validate state schema."""

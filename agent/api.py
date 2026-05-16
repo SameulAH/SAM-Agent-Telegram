@@ -20,15 +20,28 @@ from typing import Optional
 def create_app():
     """Create FastAPI application."""
     try:
-        from fastapi import FastAPI
+        from fastapi import FastAPI, Header, HTTPException
+        from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import JSONResponse
-        
+
         app = FastAPI(
             title="SAM Agent API",
             description="Stateful Agent Model API",
             version="0.0.1"
         )
-        
+
+        # CORS — driven by ALLOWED_ORIGINS env var (comma-separated).
+        # Defaults to "*" for local dev; restrict in production via env.
+        _raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
+        _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=_allowed_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
         # Initialize health checker
         from agent.health import (
             initialize_health_checker,
@@ -194,8 +207,9 @@ def create_app():
                     raw_input=user_input
                 )
                 
-                # Invoke agent (synchronous graph execution)
-                result = agent.graph.invoke(state)
+                # Use ainvoke so the async FastAPI handler doesn't trigger
+                # LangGraph's thread-pool pickle path for non-serialisable objects.
+                result = await agent.graph.ainvoke(state)
                 
                 # model output source: AgentState.final_output (written by result_handling_node)
                 # result dict is the final merged state from the orchestrator
@@ -228,25 +242,31 @@ def create_app():
         # ===================================================================
         
         # Check if observability is enabled
-        import os
         observability_enabled = os.getenv("LOCAL_OBSERVABILITY_ENABLED", "false").lower() == "true"
-        
+        _debug_token = os.getenv("DEBUG_API_TOKEN", "")
+
         if observability_enabled:
             from agent.observability import LocalObservabilityInterface, get_observability, set_observability, ObservabilityStore
-            
+
             # Initialize global observability on first request
             _observability_instance = [None]  # Use list to allow mutation in nested function
-            
+
             def get_or_create_observability():
                 if _observability_instance[0] is None:
                     store = ObservabilityStore()
                     _observability_instance[0] = LocalObservabilityInterface(store=store)
                     set_observability(_observability_instance[0])
                 return _observability_instance[0]
-            
+
+            def _verify_debug_token(x_debug_token: str = Header(None)) -> None:
+                """Require X-Debug-Token header when DEBUG_API_TOKEN is configured."""
+                if _debug_token and x_debug_token != _debug_token:
+                    raise HTTPException(status_code=403, detail="Invalid or missing debug token")
+
             @app.get("/debug/health")
-            async def debug_health():
+            async def debug_health(x_debug_token: str = Header(None)):
                 """Get agent health and configuration."""
+                _verify_debug_token(x_debug_token)
                 if not observability_enabled:
                     return JSONResponse({"error": "Observability disabled"}, status_code=404)
                 
@@ -264,8 +284,9 @@ def create_app():
                     )
             
             @app.get("/debug/graph")
-            async def debug_graph():
+            async def debug_graph(x_debug_token: str = Header(None)):
                 """Get graph structure (static, no execution state)."""
+                _verify_debug_token(x_debug_token)
                 if not observability_enabled:
                     return JSONResponse({"error": "Observability disabled"}, status_code=404)
                 
@@ -287,8 +308,9 @@ def create_app():
                     )
             
             @app.get("/debug/traces")
-            async def debug_traces(limit: int = 50):
+            async def debug_traces(limit: int = 50, x_debug_token: str = Header(None)):
                 """Get recent trace metadata (no content)."""
+                _verify_debug_token(x_debug_token)
                 if not observability_enabled:
                     return JSONResponse({"error": "Observability disabled"}, status_code=404)
                 
@@ -309,8 +331,9 @@ def create_app():
                     )
             
             @app.get("/debug/spans")
-            async def debug_spans(limit: int = 100):
+            async def debug_spans(limit: int = 100, x_debug_token: str = Header(None)):
                 """Get recent span metadata (no content)."""
+                _verify_debug_token(x_debug_token)
                 if not observability_enabled:
                     return JSONResponse({"error": "Observability disabled"}, status_code=404)
                 
@@ -330,8 +353,9 @@ def create_app():
                     )
             
             @app.get("/debug/memory")
-            async def debug_memory(limit: int = 100):
+            async def debug_memory(limit: int = 100, x_debug_token: str = Header(None)):
                 """Get memory operation metadata (no content)."""
+                _verify_debug_token(x_debug_token)
                 if not observability_enabled:
                     return JSONResponse({"error": "Observability disabled"}, status_code=404)
                 
@@ -351,8 +375,9 @@ def create_app():
                     )
             
             @app.get("/debug/stats")
-            async def debug_stats():
+            async def debug_stats(x_debug_token: str = Header(None)):
                 """Get observability store statistics."""
+                _verify_debug_token(x_debug_token)
                 if not observability_enabled:
                     return JSONResponse({"error": "Observability disabled"}, status_code=404)
                 
@@ -378,18 +403,10 @@ def create_app():
 
 def main(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
     """Run agent API server."""
-    # ── Logging setup (must run before uvicorn reconfigures logging) ──────────
-    _log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
-    _log_fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    logging.basicConfig(level=_log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    # Pin a StreamHandler to the 'agent' namespace so [LATENCY]/[DMA] logs
-    # survive Uvicorn's dictConfig overwrite of the root logger.
-    _agent_logger = logging.getLogger("agent")
-    _agent_logger.setLevel(_log_level)
-    if not _agent_logger.handlers:
-        _h = logging.StreamHandler()
-        _h.setFormatter(_log_fmt)
-        _agent_logger.addHandler(_h)
+    # Configure logging once (format + level from LOG_FORMAT / LOG_LEVEL env vars).
+    # Must run before uvicorn reconfigures the root logger.
+    from agent.logging_config import configure_logging
+    configure_logging()
 
     app = create_app()
     

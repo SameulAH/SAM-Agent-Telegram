@@ -14,18 +14,30 @@ authors = [
 ]
 
 dependencies = [
-  "langgraph>=0.0.50",
-  "langchain>=0.1.0",
-  "pydantic>=2.0",
+  # Core framework — pinned to installed major version to prevent breaking upgrades
+  "langgraph>=1.0.0,<2.0.0",
+  "langchain>=0.1.0,<1.0.0",
+  "pydantic>=2.0,<3.0",
+  # HTTP clients
+  "httpx>=0.24.0",
   "requests>=2.31.0",
+  # Application framework
+  "fastapi>=0.104.0,<1.0.0",
+  "uvicorn>=0.24.0",
+  # Configuration
   "python-dotenv>=1.0.0",
+  # Storage / memory
   "qdrant-client>=1.14,<2.0",
+  # Speech (optional — installed conditionally in Docker)
   "openai-whisper>=20230314",
   "TTS>=0.22.0",
-  "fastapi>=0.104.0",
-  "uvicorn>=0.24.0",
+  # Utilities
   "cachetools>=5.3",
-  "types-cachetools>=5.3"
+  "types-cachetools>=5.3",
+  # Observability
+  "opentelemetry-api>=1.20.0",
+  "opentelemetry-sdk>=1.20.0",
+  "opentelemetry-exporter-otlp>=1.20.0",
 ]
 [project.optional-dependencies]
 dev = [

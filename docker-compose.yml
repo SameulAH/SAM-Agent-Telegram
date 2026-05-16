@@ -99,7 +99,8 @@ services:
       SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
       
       # Tracing backend
-      TRACER_BACKEND: ${TRACER_BACKEND:-noop}
+      TRACER_BACKEND: ${TRACER_BACKEND:-otel}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
 
       # Logging
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -137,12 +138,42 @@ services:
       qdrant:
         condition: service_started
         required: false
+      otel-collector:
+        condition: service_started
     
     # Always restart on failure
     restart: unless-stopped
     
     # Security
     user: "1000:1000"
+  
+  # =========================================================================
+  # Observability Services (OpenTelemetry + Jaeger)
+  # =========================================================================
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    networks:
+      - sam_network
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "14250:14250" # Jaeger Collector
+    networks:
+      - sam_network
   
   # =========================================================================
   # Ollama LLM Service (Required)

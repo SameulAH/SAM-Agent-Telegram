@@ -1,6 +1,8 @@
 import json
 import re
-import requests
+import time
+import logging
+import httpx
 from .base import ModelBackend
 from .types import ModelRequest, ModelResponse
 
@@ -11,6 +13,8 @@ from .types import ModelRequest, ModelResponse
 # ──────────────────────────────────────────────────────────────────────────────
 from agent.prompting.prompt_builder import SYSTEM_PROMPT as _SYSTEM_PROMPT  # noqa: E402
 
+logger = logging.getLogger(__name__)
+
 # Regex to locate the [TOOL_CALL] marker (case-insensitive for robustness)
 # Also matches [Web_Search] and [web_search] emitted by phi3:mini and similar models
 _TOOL_CALL_MARKER_RE = re.compile(r"\[TOOL_CALL\]|\[Web_Search\]", re.IGNORECASE)
@@ -20,6 +24,10 @@ _TOOL_CALL_MARKER_RE = re.compile(r"\[TOOL_CALL\]|\[Web_Search\]", re.IGNORECASE
 _QUERY_FALLBACK_RE = re.compile(r'"query"\s*:\s*"([^"]*)"?')
 # Pattern for bare {"query": "..."} that phi3:mini emits after [Web_Search]
 _BARE_QUERY_RE = re.compile(r'\{\s*"query"\s*:\s*"([^"]*)"', re.IGNORECASE)
+
+# Retry configuration
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY_S = 1.0  # doubles each attempt: 1s, 2s, 4s
 
 
 def _extract_tool_call(output: str):
@@ -174,6 +182,11 @@ class OllamaModelBackend(ModelBackend):
     Parses [TOOL_CALL]{...} markers from the model output and stores the
     decoded tool call in ModelResponse.metadata["tool_call"] so the
     LangGraph orchestrator can route to the tool execution node.
+
+    Retries transient failures (connection errors, timeouts) up to
+    _MAX_RETRIES times with exponential backoff before returning a
+    recoverable_error status. This handles Ollama container restarts
+    and transient network blips without surfacing errors to the user.
     """
 
     def __init__(self, model_name: str, base_url: str = "http://localhost:11434"):
@@ -193,7 +206,7 @@ class OllamaModelBackend(ModelBackend):
 
         Flow:
           1. Build a messages list: [system, (optional context), user]
-          2. POST to /api/chat
+          2. POST to /api/chat with up to _MAX_RETRIES retries on transient errors
           3. Parse response for [TOOL_CALL] marker
           4. If found → set metadata["tool_call"] so orchestrator routes to tool node
           5. If request.context is provided (second call after tool execution) →
@@ -211,66 +224,103 @@ class OllamaModelBackend(ModelBackend):
             "trace_id": request.trace_id,
         }
 
-        try:
-            # Use request.system_prompt if provided (Phase Consciousness), 
-            # otherwise fallback to authoritative _SYSTEM_PROMPT.
-            sys_p = request.system_prompt if request.system_prompt else _SYSTEM_PROMPT
-            messages = [{"role": "system", "content": sys_p}]
+        # Use request.system_prompt if provided (Phase Consciousness),
+        # otherwise fallback to authoritative _SYSTEM_PROMPT.
+        sys_p = request.system_prompt if request.system_prompt else _SYSTEM_PROMPT
+        messages = [{"role": "system", "content": sys_p}]
 
-            # Build user message — inject tool results on second call
-            if request.context:
-                user_content = (
-                    f"Search results retrieved for your query:\n\n"
-                    f"{request.context}\n\n"
-                    f"---\n"
-                    f"Using the above results, please answer:\n{request.prompt}"
+        # Build user message — inject tool results on second call
+        if request.context:
+            user_content = (
+                f"Search results retrieved for your query:\n\n"
+                f"{request.context}\n\n"
+                f"---\n"
+                f"Using the above results, please answer:\n{request.prompt}"
+            )
+        else:
+            user_content = request.prompt
+
+        messages.append({"role": "user", "content": user_content})
+
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "stream": False,
+        }
+
+        url = f"{self.base_url}/api/chat"
+        last_error: Exception | None = None
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                with httpx.Client(timeout=request.timeout_s) as client:
+                    resp = client.post(url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                output: str = data.get("message", {}).get("content", "")
+
+                # ── Parse [TOOL_CALL] marker ────────────────────────────────
+                metadata = dict(base_metadata)
+                tool_call_data, output = _extract_tool_call(output)
+                # Fallback: detect loose patterns if [TOOL_CALL] marker was not used
+                if not tool_call_data:
+                    tool_call_data, output = _try_loose_tool_call(output)
+                if tool_call_data:
+                    metadata["tool_call"] = tool_call_data
+
+                return ModelResponse(
+                    status="success",
+                    output=output,
+                    metadata=metadata,
                 )
-            else:
-                user_content = request.prompt
 
-            messages.append({"role": "user", "content": user_content})
+            except httpx.TimeoutException as e:
+                last_error = e
+                logger.warning(
+                    "Ollama timeout on attempt %d/%d (trace=%s)",
+                    attempt + 1, _MAX_RETRIES, request.trace_id,
+                )
 
-            payload = {
-                "model": self.model_name,
-                "messages": messages,
-                "stream": False,
-            }
+            except httpx.TransportError as e:
+                last_error = e
+                logger.warning(
+                    "Ollama transport error on attempt %d/%d: %s (trace=%s)",
+                    attempt + 1, _MAX_RETRIES, e, request.trace_id,
+                )
 
-            resp = requests.post(
-                f"{self.base_url}/api/chat",
-                json=payload,
-                timeout=request.timeout_s,
-            )
+            except httpx.HTTPStatusError as e:
+                # 4xx errors are not retryable (bad request, model not found, etc.)
+                logger.error(
+                    "Ollama HTTP %d error (not retrying): %s (trace=%s)",
+                    e.response.status_code, e, request.trace_id,
+                )
+                return ModelResponse(
+                    status="fatal_error",
+                    error_type="backend_unavailable",
+                    metadata={**base_metadata, "error": str(e)},
+                )
 
-            resp.raise_for_status()
-            data = resp.json()
-            output: str = data.get("message", {}).get("content", "")
+            except Exception as e:
+                last_error = e
+                logger.error(
+                    "Ollama unexpected error on attempt %d/%d: %s (trace=%s)",
+                    attempt + 1, _MAX_RETRIES, e, request.trace_id,
+                )
 
-            # ── Parse [TOOL_CALL] marker ────────────────────────────────────
-            metadata = dict(base_metadata)
-            tool_call_data, output = _extract_tool_call(output)
-            # Fallback: detect loose patterns if [TOOL_CALL] marker was not used
-            if not tool_call_data:
-                tool_call_data, output = _try_loose_tool_call(output)
-            if tool_call_data:
-                metadata["tool_call"] = tool_call_data
+            # Exponential backoff before next retry (skip sleep on last attempt)
+            if attempt < _MAX_RETRIES - 1:
+                delay = _RETRY_BASE_DELAY_S * (2 ** attempt)
+                logger.info("Retrying Ollama in %.1fs...", delay)
+                time.sleep(delay)
 
-            return ModelResponse(
-                status="success",
-                output=output,
-                metadata=metadata,
-            )
-
-        except requests.Timeout:
-            return ModelResponse(
-                status="recoverable_error",
-                error_type="timeout",
-                metadata=base_metadata,
-            )
-
-        except Exception as e:
-            return ModelResponse(
-                status="fatal_error",
-                error_type="backend_unavailable",
-                metadata={**base_metadata, "error": str(e)},
-            )
+        # All retries exhausted
+        error_type = "timeout" if isinstance(last_error, httpx.TimeoutException) else "backend_unavailable"
+        logger.error(
+            "Ollama failed after %d attempts (trace=%s): %s",
+            _MAX_RETRIES, request.trace_id, last_error,
+        )
+        return ModelResponse(
+            status="recoverable_error",
+            error_type=error_type,
+            metadata={**base_metadata, "error": str(last_error)},
+        )

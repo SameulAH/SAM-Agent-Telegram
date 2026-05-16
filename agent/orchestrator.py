@@ -62,6 +62,12 @@ def _default_ltm_store():
         return StubLongTermMemoryStore()
 
 
+def _default_tracer():
+    """Return the configured tracer backend."""
+    from agent.tracing.tracer_factory import create_tracer
+    return create_tracer()
+
+
 class SAMOrchestrator:
     """
     Main orchestrator for the SAM agent.
@@ -80,6 +86,7 @@ class SAMOrchestrator:
             model_backend=model_backend or _default_model_backend(),
             memory_controller=_default_stm_store(),
             long_term_memory_store=_default_ltm_store(),
+            tracer=_default_tracer(),
         )
     
     async def invoke(self, raw_input: str, conversation_id: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
@@ -104,9 +111,23 @@ class SAMOrchestrator:
             except Exception as e:
                 logger.warning(f"Failed to run reflection: {e}")
 
+        def _on_reflection_done(task: asyncio.Task) -> None:
+            """Log any unhandled exception that escaped the reflection coroutine."""
+            if task.cancelled():
+                logger.debug("Reflection task was cancelled (likely shutdown)")
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error(
+                    "Background reflection task raised an unhandled exception: %s",
+                    exc,
+                    exc_info=exc,
+                )
+
         try:
-            asyncio.create_task(delayed_reflect())
+            task = asyncio.create_task(delayed_reflect())
+            task.add_done_callback(_on_reflection_done)
         except Exception as e:
             logger.warning(f"Failed to start background reflection task: {e}")
-            
+
         return result
