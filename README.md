@@ -1443,16 +1443,7 @@ SAM-Agent-Telegram/
 6. Update `decision_logic_node` with the new command emission logic
 7. Document the "MUST NOT" constraints in the node's docstring
 
-### Code review checklist
 
-- [ ] New node follows single-responsibility (one job, explicit MUST NOT list)
-- [ ] Memory operations are non-fatal (return typed response, never raise)
-- [ ] Tracing calls are wrapped in `try/except Exception: pass`
-- [ ] State field ownership is documented in the node docstring
-- [ ] Stub implementation exists for any new external dependency
-- [ ] Phase tag added to new state fields (e.g., `# Phase MyPhase`)
-- [ ] Tests added for the new node or backend
-- [ ] `.env.example` updated for any new environment variables
 
 ### Running the CI checks locally
 
@@ -1825,120 +1816,13 @@ docker exec sam-agent-ollama ollama pull phi3
 grep OLLAMA_MODEL .env
 ```
 
----
-
-#### Qdrant LTM writes fail silently
-
-**Cause:** Qdrant container not running, or the collection doesn't exist yet.
-
-**Fix:**
-```bash
-# Check Qdrant health
-curl http://localhost:6333/healthz
-
-# The collection is created automatically on first write.
-# If it fails, check logs:
-docker logs sam-agent-qdrant --tail=50
-docker logs sam-agent --tail=50 | grep -i qdrant
-```
 
 ---
 
-#### STT fails — voice messages not transcribed
 
-**Cause:** Whisper model not downloaded, or `STT_ENABLED=false`.
 
-**Fix:**
-```bash
-# Verify STT is enabled
-grep STT_ENABLED .env   # should be "true"
 
-# Whisper downloads on first use — check for download errors:
-docker logs sam-agent --tail=100 | grep -i whisper
-
-# If CUDA errors: set WHISPER_DEVICE=cpu in .env
-```
-
----
-
-#### Agent /health/ready fails — `agent_logic_ok: false`
-
-**Cause:** A broken import somewhere in `agent/orchestrator.py` import chain.
-
-**Debug steps:**
-```bash
-# Enter the container and test imports manually
-docker exec -it sam-agent python -c "from agent.orchestrator import SAMOrchestrator; print('OK')"
-
-# If import fails, read the full traceback:
-docker exec -it sam-agent python -c "
-import traceback
-try:
-    from agent.orchestrator import SAMOrchestrator
-except Exception:
-    traceback.print_exc()
-"
-```
-
----
-
----
-
-## 27. Model Selection Guide
-
-SAM is model-agnostic at the inference layer — any model available in Ollama can be used by changing `OLLAMA_MODEL`. This section documents the practical trade-offs for models tested with SAM's specific workload (personal assistant, tool calling, structured JSON output for reflection).
-
-### Comparison table
-
-| Model | Size | RAM required | CPU latency | GPU latency | Tool calling | JSON output | Best for |
-|-------|------|-------------|-------------|-------------|-------------|------------|---------|
-| `phi3:mini` | 2.2 GB | ~4 GB | 8–15 s | 1–3 s | ✅ Good | ✅ Good | Default — fast, balanced |
-| `phi3:latest` | 3.8 GB | ~6 GB | 15–30 s | 2–5 s | ✅ Good | ✅ Good | Better reasoning, longer context |
-| `llama3:8b` | 4.7 GB | ~8 GB | 25–45 s | 3–7 s | ⚠️ Variable | ✅ Good | Higher quality, slower |
-| `mistral:7b` | 4.1 GB | ~7 GB | 20–35 s | 3–6 s | ⚠️ Variable | ✅ Good | Good general-purpose |
-| `phi:latest` | 1.6 GB | ~3 GB | 5–10 s | <1 s | ❌ Weak | ⚠️ Partial | Low-resource environments |
-| `gemma2:2b` | 1.6 GB | ~3 GB | 5–12 s | 1–2 s | ❌ Weak | ⚠️ Partial | Ultra-low memory |
-
-**Tool calling compatibility note:** SAM's tool call parser supports the `[TOOL_CALL]{...}` marker, `[Web_Search]{...}` shorthand (phi3:mini specific), and loose `{"name":..., "arguments":...}` JSON. Models that don't use these patterns fall back to `_try_loose_tool_call()` in `inference/ollama.py` — test any new model against the tool intent integration tests before production use.
-
-### Switching the model
-
-```bash
-# 1. Pull the new model into Ollama
-docker exec sam-agent-ollama ollama pull llama3:8b
-
-# 2. Update .env
-OLLAMA_MODEL=llama3:8b
-
-# 3. Restart the agent (container volume-mounts the code, so just restart)
-docker restart sam-agent
-
-# 4. Verify
-curl http://localhost:8000/invoke \
-  -H "Content-Type: application/json" \
-  -d '{"input": "What is 2 + 2?"}' | python -m json.tool
-```
-
-### Tool call testing after model switch
-
-```bash
-# This query must trigger a tool call (financial freshness keyword)
-curl -s http://localhost:8000/invoke \
-  -H "Content-Type: application/json" \
-  -d '{"input": "What is the current Bitcoin price?"}' | python -m json.tool
-
-# The response should contain real web search results, not training data.
-# If it returns "I cannot provide real-time data" — the tool call failed to parse.
-# Check: docker logs sam-agent --tail=30 | grep -i "tool_call\|tool_exec"
-```
-
-### Memory and context length
-
-`phi3:mini` and `phi3:latest` have a 128k token context window — significantly larger than `llama3:8b` (8k). For SAM's use case this only matters for very long conversation histories injected from STM. With the current `_MAX_MEMORY_CHARS = 2000` cap (~500 tokens), any model supports the injected context window comfortably.
-
----
-
-## 28. Evaluation Framework
+## 27. Evaluation Framework
 
 SAM includes an offline evaluation framework in `evaluation/` and `experiment_harness/` for systematically measuring agent quality. This is **entirely separate from the production agent** — it runs against recorded traces, not live traffic.
 
@@ -2002,23 +1886,6 @@ python evaluation/compare_runs.py \
 cat outputs/experiments/*.json | python -m json.tool
 ```
 
-### Adding a new experiment
-
-1. Copy `experiments/templates/experiment_spec.yaml` to `experiments/EXP-XXX/spec.yaml`
-2. Define `hypothesis`, `changed_variable`, `variant_id`, and `metrics_used`
-3. Create or reference a dataset in `experiments/EXP-XXX/dataset.json`
-4. Run via `experiment_harness/runner.py`
-5. Commit the `spec.yaml` and `dataset.json` — never commit `results.json` or `metrics.json` (generated artifacts, gitignored via `outputs/`)
-
-### EXP-001 — Baseline reference
-
-`EXP-001` is the canonical baseline: phi3 with no memory, no tools, 35 fixed prompts. It establishes the floor for:
-- `task_completion_rate` — what % succeed without any agent features
-- `hallucination_proxy_rate` — base model uncertainty
-- `response_time_ms` — raw Ollama latency on CPU
-
-All future experiments that change agent behavior should compare against these baseline numbers.
-
 ---
 
 ## 29. Data Privacy & Retention
@@ -2035,33 +1902,6 @@ SAM stores two categories of user data. Understanding the storage contract matte
 | **Trace data** | Jaeger (local Docker) | Same as LangSmith, local only | OTel tracer | In-memory only — lost on container restart |
 | **Log data** | stdout / container logs | Structured log lines (no message content by default at INFO level) | Python logging | Per container/host log rotation policy |
 
-### What is NOT stored
-
-- Raw user messages are never persisted directly — only the processed `preprocessing_result` and the agent's synthesised reply
-- API keys and credentials are never written to any storage backend
-- Tool call arguments (search queries) are logged at DEBUG level only; not stored in SQLite or Qdrant
-
-### Deleting user data
-
-```bash
-# Delete all short-term memory for a specific user (conversation_id = "telegram_{chat_id}")
-docker exec sam-agent python -c "
-from agent.memory.sqlite import SQLiteShortTermMemoryStore
-store = SQLiteShortTermMemoryStore('/app/data/memory.db')
-store.clear_conversation('telegram_YOUR_CHAT_ID')
-print('STM cleared')
-"
-
-# Delete all long-term memory facts (Qdrant — entire collection)
-curl -X DELETE http://localhost:6333/collections/long_term_memory
-# The collection is recreated automatically on next LTM write.
-
-# Delete long-term memory for a specific conversation_id (scroll + delete)
-# Use the Qdrant REST API or qdrant-client SDK directly.
-curl -X POST http://localhost:6333/collections/long_term_memory/points/delete \
-  -H "Content-Type: application/json" \
-  -d '{"filter": {"must": [{"key": "conversation_id", "match": {"value": "telegram_YOUR_CHAT_ID"}}]}}'
-```
 
 ### Data minimisation principles applied
 
@@ -2132,45 +1972,6 @@ curl -X POST "http://localhost:6333/collections/long_term_memory/snapshots/uploa
           curl -s -X POST http://localhost:6333/collections/long_term_memory/snapshots > /dev/null && \
           echo "[$(date)] Backup complete" >> /var/log/sam-backup.log
 ```
-
-### Disaster recovery runbook
-
-```
-1. AGENT IS DOWN — NOT RESPONDING
-   → docker ps → check sam-agent status
-   → docker logs sam-agent --tail=50 → read the error
-   → docker restart sam-agent → wait 30s → curl /health/ready
-   → If still failing: docker compose down && docker compose up -d
-
-2. OLLAMA NOT RESPONDING — MODEL ERRORS
-   → docker logs sam-agent-ollama --tail=20
-   → docker exec sam-agent-ollama ollama list → confirm model is present
-   → docker exec sam-agent-ollama ollama pull phi3 → re-pull if missing
-   → docker restart sam-agent-ollama
-
-3. QDRANT DATA LOST
-   → docker logs sam-agent-qdrant --tail=20
-   → Restore from snapshot (see above)
-   → The collection is recreated on first LTM write if missing —
-     agent continues with empty LTM (STM still intact in SQLite)
-
-4. SQLITE CORRUPTED
-   → docker exec sam-agent sqlite3 /app/data/memory.db "PRAGMA integrity_check"
-   → If corrupt: restore from latest backup
-   → Agent continues with empty STM while Qdrant LTM remains intact
-
-5. NGROK TUNNEL DOWN — TELEGRAM NOT REACHING AGENT
-   → ./ngrok http 8000 --domain=YOUR-STATIC-DOMAIN.ngrok-free.app
-   → curl http://localhost:8000/webhook/telegram/webhook-info
-   → pending_update_count drops to 0 when tunnel is live
-
-6. FULL STACK REBUILD
-   → docker compose down -v     ← removes all volumes (DESTRUCTIVE)
-   → Restore SQLite from backup → docker compose up -d
-   → docker exec sam-agent-ollama ollama pull phi3
-   → Restore Qdrant snapshot
-```
-
 ---
 
 ## Licence
