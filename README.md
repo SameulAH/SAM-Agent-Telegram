@@ -40,6 +40,10 @@ The system is explicitly designed for **operational reliability over capability 
 24. [Performance Profile](#24-performance-profile)
 25. [Security Model](#25-security-model)
 26. [Local Development & Troubleshooting](#26-local-development--troubleshooting)
+27. [Model Selection Guide](#27-model-selection-guide)
+28. [Evaluation Framework](#28-evaluation-framework)
+29. [Data Privacy & Retention](#29-data-privacy--retention)
+30. [Backup & Recovery](#30-backup--recovery)
 
 ---
 
@@ -1874,6 +1878,297 @@ try:
 except Exception:
     traceback.print_exc()
 "
+```
+
+---
+
+---
+
+## 27. Model Selection Guide
+
+SAM is model-agnostic at the inference layer — any model available in Ollama can be used by changing `OLLAMA_MODEL`. This section documents the practical trade-offs for models tested with SAM's specific workload (personal assistant, tool calling, structured JSON output for reflection).
+
+### Comparison table
+
+| Model | Size | RAM required | CPU latency | GPU latency | Tool calling | JSON output | Best for |
+|-------|------|-------------|-------------|-------------|-------------|------------|---------|
+| `phi3:mini` | 2.2 GB | ~4 GB | 8–15 s | 1–3 s | ✅ Good | ✅ Good | Default — fast, balanced |
+| `phi3:latest` | 3.8 GB | ~6 GB | 15–30 s | 2–5 s | ✅ Good | ✅ Good | Better reasoning, longer context |
+| `llama3:8b` | 4.7 GB | ~8 GB | 25–45 s | 3–7 s | ⚠️ Variable | ✅ Good | Higher quality, slower |
+| `mistral:7b` | 4.1 GB | ~7 GB | 20–35 s | 3–6 s | ⚠️ Variable | ✅ Good | Good general-purpose |
+| `phi:latest` | 1.6 GB | ~3 GB | 5–10 s | <1 s | ❌ Weak | ⚠️ Partial | Low-resource environments |
+| `gemma2:2b` | 1.6 GB | ~3 GB | 5–12 s | 1–2 s | ❌ Weak | ⚠️ Partial | Ultra-low memory |
+
+**Tool calling compatibility note:** SAM's tool call parser supports the `[TOOL_CALL]{...}` marker, `[Web_Search]{...}` shorthand (phi3:mini specific), and loose `{"name":..., "arguments":...}` JSON. Models that don't use these patterns fall back to `_try_loose_tool_call()` in `inference/ollama.py` — test any new model against the tool intent integration tests before production use.
+
+### Switching the model
+
+```bash
+# 1. Pull the new model into Ollama
+docker exec sam-agent-ollama ollama pull llama3:8b
+
+# 2. Update .env
+OLLAMA_MODEL=llama3:8b
+
+# 3. Restart the agent (container volume-mounts the code, so just restart)
+docker restart sam-agent
+
+# 4. Verify
+curl http://localhost:8000/invoke \
+  -H "Content-Type: application/json" \
+  -d '{"input": "What is 2 + 2?"}' | python -m json.tool
+```
+
+### Tool call testing after model switch
+
+```bash
+# This query must trigger a tool call (financial freshness keyword)
+curl -s http://localhost:8000/invoke \
+  -H "Content-Type: application/json" \
+  -d '{"input": "What is the current Bitcoin price?"}' | python -m json.tool
+
+# The response should contain real web search results, not training data.
+# If it returns "I cannot provide real-time data" — the tool call failed to parse.
+# Check: docker logs sam-agent --tail=30 | grep -i "tool_call\|tool_exec"
+```
+
+### Memory and context length
+
+`phi3:mini` and `phi3:latest` have a 128k token context window — significantly larger than `llama3:8b` (8k). For SAM's use case this only matters for very long conversation histories injected from STM. With the current `_MAX_MEMORY_CHARS = 2000` cap (~500 tokens), any model supports the injected context window comfortably.
+
+---
+
+## 28. Evaluation Framework
+
+SAM includes an offline evaluation framework in `evaluation/` and `experiment_harness/` for systematically measuring agent quality. This is **entirely separate from the production agent** — it runs against recorded traces, not live traffic.
+
+### Architecture
+
+```
+experiments/EXP-001/spec.yaml      ← experiment definition
+    │  (hypothesis, metrics, dataset, min_runs)
+    ▼
+experiment_harness/runner.py       ← orchestrates experiment execution
+    │  loads spec → runs agent against dataset → collects traces
+    ▼
+experiments/EXP-001/results.json   ← raw trace results
+    │  [{prompt_id, input, output, latency_ms, status, trace_id}...]
+    ▼
+evaluation/metrics/*.py            ← pure metric extractors
+    │  compute_*() functions on Trace objects
+    ▼
+experiments/EXP-001/metrics.json   ← aggregated metric results
+    │  [{metric_id, value, samples, valid}...]
+    ▼
+evaluation/compare_runs.py         ← A/B comparison between experiments
+    │  compares two metrics.json files
+    ▼
+outputs/experiments/*.json         ← decision reports (improve/revert/hold)
+```
+
+### Metric dimensions (Phase 5.2)
+
+| File | Metric ID | Direction | What it measures |
+|------|-----------|-----------|-----------------|
+| `task_completion.py` | `task_completion_rate` | Higher ↑ | % of prompts with non-empty, non-error output |
+| `task_completion.py` | `timeout_rate` | Lower ↓ | % of prompts that exceeded latency threshold |
+| `latency_quality.py` | `response_time_ms` | Lower ↓ | Median response time (ms) at terminal nodes |
+| `latency_quality.py` | `latency_p95_ms` | Lower ↓ | 95th percentile latency — catches tail latency spikes |
+| `memory_usefulness.py` | `memory_operations_count` | Context | Total STM/LTM reads+writes per run |
+| `hallucination_proxies.py` | `hallucination_proxy_rate` | Lower ↓ | Proxy: % outputs with uncertainty markers ("I think", "probably") |
+| `retry_pressure.py` | `retry_pressure` | Lower ↓ | Proxy: % of runs that triggered error_router_node |
+
+All metric functions are **pure and deterministic** — same input always produces the same output. They operate on `Trace` objects deserialized from `results.json`, never on live traffic.
+
+### Running an experiment
+
+```bash
+# 1. Run the baseline experiment against the fixed dataset
+python experiment_harness/runner.py \
+  --spec experiments/EXP-001/spec.yaml \
+  --output experiments/EXP-001/
+
+# 2. Compute metrics from the collected results
+python experiment_harness/evaluator.py \
+  --results experiments/EXP-001/results.json \
+  --output experiments/EXP-001/metrics.json
+
+# 3. Compare two experiment runs (A/B test)
+python evaluation/compare_runs.py \
+  --baseline experiments/EXP-001/metrics.json \
+  --variant outputs/experiments/my-new-experiment.json
+
+# 4. View result (decision: improve / revert / hold)
+cat outputs/experiments/*.json | python -m json.tool
+```
+
+### Adding a new experiment
+
+1. Copy `experiments/templates/experiment_spec.yaml` to `experiments/EXP-XXX/spec.yaml`
+2. Define `hypothesis`, `changed_variable`, `variant_id`, and `metrics_used`
+3. Create or reference a dataset in `experiments/EXP-XXX/dataset.json`
+4. Run via `experiment_harness/runner.py`
+5. Commit the `spec.yaml` and `dataset.json` — never commit `results.json` or `metrics.json` (generated artifacts, gitignored via `outputs/`)
+
+### EXP-001 — Baseline reference
+
+`EXP-001` is the canonical baseline: phi3 with no memory, no tools, 35 fixed prompts. It establishes the floor for:
+- `task_completion_rate` — what % succeed without any agent features
+- `hallucination_proxy_rate` — base model uncertainty
+- `response_time_ms` — raw Ollama latency on CPU
+
+All future experiments that change agent behavior should compare against these baseline numbers.
+
+---
+
+## 29. Data Privacy & Retention
+
+SAM stores two categories of user data. Understanding the storage contract matters for personal deployments and for any compliance considerations.
+
+### What is stored — and where
+
+| Data category | Storage | Content | Written by | TTL |
+|--------------|---------|---------|-----------|-----|
+| **Conversation context** | SQLite `short_term_memory` table | Recent conversation turns (JSON), formatted for model injection | `memory_write_node` | `STM_TTL_SECONDS` (default: 7 days). Evicted automatically on next write after TTL expires. |
+| **Personal facts** | Qdrant `long_term_memory` collection | Extracted biographical facts: name, location, preferences, goals, mood insights | `long_term_memory_write_node`, `reflection_node` | **Permanent — no TTL**. Append-only by design. |
+| **Trace data** | LangSmith (remote) | Full execution traces: input, output, node timings, tool calls | LangSmith tracer | Per LangSmith account retention policy |
+| **Trace data** | Jaeger (local Docker) | Same as LangSmith, local only | OTel tracer | In-memory only — lost on container restart |
+| **Log data** | stdout / container logs | Structured log lines (no message content by default at INFO level) | Python logging | Per container/host log rotation policy |
+
+### What is NOT stored
+
+- Raw user messages are never persisted directly — only the processed `preprocessing_result` and the agent's synthesised reply
+- API keys and credentials are never written to any storage backend
+- Tool call arguments (search queries) are logged at DEBUG level only; not stored in SQLite or Qdrant
+
+### Deleting user data
+
+```bash
+# Delete all short-term memory for a specific user (conversation_id = "telegram_{chat_id}")
+docker exec sam-agent python -c "
+from agent.memory.sqlite import SQLiteShortTermMemoryStore
+store = SQLiteShortTermMemoryStore('/app/data/memory.db')
+store.clear_conversation('telegram_YOUR_CHAT_ID')
+print('STM cleared')
+"
+
+# Delete all long-term memory facts (Qdrant — entire collection)
+curl -X DELETE http://localhost:6333/collections/long_term_memory
+# The collection is recreated automatically on next LTM write.
+
+# Delete long-term memory for a specific conversation_id (scroll + delete)
+# Use the Qdrant REST API or qdrant-client SDK directly.
+curl -X POST http://localhost:6333/collections/long_term_memory/points/delete \
+  -H "Content-Type: application/json" \
+  -d '{"filter": {"must": [{"key": "conversation_id", "match": {"value": "telegram_YOUR_CHAT_ID"}}]}}'
+```
+
+### Data minimisation principles applied
+
+- `STM_TTL_SECONDS = 604800` (7 days): conversation context auto-expires
+- Personal fact extraction only runs when `memory_write_authorized = True` (DMA guardrail)
+- LTM write guardrails: max 1,000 facts/conversation, max 5,000 facts/user
+- Reflection insights are typed (`mood`, `interest`, `bio`, `goal`) — not free-form verbatim copies of messages
+- LangSmith can be disabled entirely by setting `TRACER_BACKEND=noop`
+
+---
+
+## 30. Backup & Recovery
+
+### SQLite — Short-Term Memory
+
+SQLite with `PRAGMA journal_mode=WAL` supports **online backup** without locking the database:
+
+```bash
+# Live backup (safe while agent is running — WAL mode supports this)
+docker exec sam-agent sqlite3 /app/data/memory.db \
+  ".backup /app/data/memory.db.bak"
+
+# Or copy the volume directly (requires brief agent pause for consistency)
+docker stop sam-agent
+docker run --rm \
+  -v sam-agent-telegram_sqlite_data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine tar czf /backup/sqlite_$(date +%Y%m%d).tar.gz /data
+docker start sam-agent
+
+# Restore
+docker stop sam-agent
+docker run --rm \
+  -v sam-agent-telegram_sqlite_data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine sh -c "cd / && tar xzf /backup/sqlite_YYYYMMDD.tar.gz"
+docker start sam-agent
+```
+
+### Qdrant — Long-Term Memory
+
+Qdrant exposes a **snapshot API** for consistent collection backups:
+
+```bash
+# Create a snapshot of the LTM collection
+curl -X POST http://localhost:6333/collections/long_term_memory/snapshots
+
+# List available snapshots
+curl http://localhost:6333/collections/long_term_memory/snapshots
+
+# Download a snapshot (replace SNAPSHOT_NAME with the returned name)
+curl -o ltm_backup.tar \
+  "http://localhost:6333/collections/long_term_memory/snapshots/SNAPSHOT_NAME"
+
+# Restore a snapshot to a (possibly empty) Qdrant instance
+curl -X POST "http://localhost:6333/collections/long_term_memory/snapshots/upload" \
+  -H "Content-Type: multipart/form-data" \
+  -F "snapshot=@ltm_backup.tar"
+```
+
+### Automated daily backup (cron example)
+
+```bash
+# Add to host crontab: crontab -e
+# Runs at 02:00 daily — backs up both SQLite and Qdrant snapshot
+
+0 2 * * * docker exec sam-agent sqlite3 /app/data/memory.db ".backup /app/data/memory_$(date +\%Y\%m\%d).db" && \
+          curl -s -X POST http://localhost:6333/collections/long_term_memory/snapshots > /dev/null && \
+          echo "[$(date)] Backup complete" >> /var/log/sam-backup.log
+```
+
+### Disaster recovery runbook
+
+```
+1. AGENT IS DOWN — NOT RESPONDING
+   → docker ps → check sam-agent status
+   → docker logs sam-agent --tail=50 → read the error
+   → docker restart sam-agent → wait 30s → curl /health/ready
+   → If still failing: docker compose down && docker compose up -d
+
+2. OLLAMA NOT RESPONDING — MODEL ERRORS
+   → docker logs sam-agent-ollama --tail=20
+   → docker exec sam-agent-ollama ollama list → confirm model is present
+   → docker exec sam-agent-ollama ollama pull phi3 → re-pull if missing
+   → docker restart sam-agent-ollama
+
+3. QDRANT DATA LOST
+   → docker logs sam-agent-qdrant --tail=20
+   → Restore from snapshot (see above)
+   → The collection is recreated on first LTM write if missing —
+     agent continues with empty LTM (STM still intact in SQLite)
+
+4. SQLITE CORRUPTED
+   → docker exec sam-agent sqlite3 /app/data/memory.db "PRAGMA integrity_check"
+   → If corrupt: restore from latest backup
+   → Agent continues with empty STM while Qdrant LTM remains intact
+
+5. NGROK TUNNEL DOWN — TELEGRAM NOT REACHING AGENT
+   → ./ngrok http 8000 --domain=YOUR-STATIC-DOMAIN.ngrok-free.app
+   → curl http://localhost:8000/webhook/telegram/webhook-info
+   → pending_update_count drops to 0 when tunnel is live
+
+6. FULL STACK REBUILD
+   → docker compose down -v     ← removes all volumes (DESTRUCTIVE)
+   → Restore SQLite from backup → docker compose up -d
+   → docker exec sam-agent-ollama ollama pull phi3
+   → Restore Qdrant snapshot
 ```
 
 ---

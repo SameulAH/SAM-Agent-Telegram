@@ -177,3 +177,4 @@ verify_skeleton.py
 # Runtime data
 data/
 *.db
+outputs/*
