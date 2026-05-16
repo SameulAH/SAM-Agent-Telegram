@@ -36,6 +36,10 @@ The system is explicitly designed for **operational reliability over capability 
 20. [Project Structure](#20-project-structure)
 21. [Glossary](#21-glossary)
 22. [Contributing Guide](#22-contributing-guide)
+23. [Prompt Engineering & Token Budget](#23-prompt-engineering--token-budget)
+24. [Performance Profile](#24-performance-profile)
+25. [Security Model](#25-security-model)
+26. [Local Development & Troubleshooting](#26-local-development--troubleshooting)
 
 ---
 
@@ -1461,6 +1465,415 @@ LLM_BACKEND=stub STM_BACKEND=sqlite LTM_BACKEND=stub \
 STT_ENABLED=false TTS_ENABLED=false TRACER_BACKEND=noop \
 TELEGRAM_BOT_TOKEN=test-token SQLITE_DB_PATH=:memory: \
 pytest tests/ -v --tb=short
+```
+
+---
+
+---
+
+## 23. Prompt Engineering & Token Budget
+
+Understanding how the model receives information is critical to tuning SAM's response quality and latency.
+
+### Prompt structure
+
+Every Ollama call assembles the following message list (in `/api/chat` format):
+
+```
+[0] role: system
+    content: SYSTEM_PROMPT   ← behavioural contract, injected by OllamaModelBackend
+
+[1] role: user
+    content:
+        [Memory Context block — if retrieved]
+        ---
+        [Tool Results block — if web search ran]
+        ---
+        [User message]
+        Answer:
+```
+
+The system prompt is never embedded in the user message — it is always the `system` role to prevent double-injection when a model backend is changed.
+
+### System prompt design
+
+The `SYSTEM_PROMPT` (defined once in `agent/prompting/prompt_builder.py`, imported by `inference/ollama.py`) encodes SAM's complete behavioural contract in 9 rules:
+
+| Rule | Directive | Engineering reason |
+|------|-----------|-------------------|
+| IDENTITY | "You are SAM. The user is ISMAIL." | Anchors persona across all contexts |
+| FORMAT | No "SAM:" prefix in replies | Prevents transport layer from receiving formatting artifacts |
+| FLOW-FIRST | Prioritise conversation transcript above all | Reduces topic drift across multi-turn sessions |
+| GROUNDING | Do not speculate | Reduces hallucination rate on personal facts |
+| SEARCH FIRST | Must call web_search for real-world data | Forces tool use instead of stale training data |
+| BREVITY | Maximum 2 sentences | Enforced in prompt AND by `format_response_node` guardrail (belt + suspenders) |
+| STABILITY | Use [CURRENT IDENTITY] to anchor persona | Prevents identity drift in long conversations |
+| MEMORY | Weave context organically | Prevents robotic "I remember that..." phrasing |
+| CURIOSITY | Ask about Ismail's life once every few turns | Drives proactive relationship building |
+
+### Context budget (from `agent/prompting/prompt_builder.py`)
+
+```python
+_MAX_MEMORY_CHARS:       int = 2000   # ≈ 500 tokens  — STM + LTM combined
+_MAX_TOOL_CHARS:         int = 1500   # ≈ 375 tokens  — web search results
+_MAX_TOTAL_INJECT_CHARS: int = 3000   # hard cap on combined injected context
+```
+
+**Priority rule:** when both memory and tool context are present and their sum exceeds `_MAX_TOTAL_INJECT_CHARS`, tool context takes priority and memory is trimmed first. Rationale: tool results answer the immediate query; memory provides background that the model can partially reconstruct from its training.
+
+### Token economics — typical request
+
+```
+Component                   Approx. tokens   Notes
+─────────────────────────── ──────────────   ─────────────────────────────────
+SYSTEM_PROMPT               ~120             Fixed per request
+Memory context (STM + LTM)  0–500           Capped at _MAX_MEMORY_CHARS
+Tool context (web search)   0–375           Capped at _MAX_TOOL_CHARS (Phase 4)
+User message                ~20–80          Typical conversational message
+Answer: marker              1
+─────────────────────────── ──────────────   ─────────────────────────────────
+Input total (no tool)       ~140–700
+Input total (with tool)     ~515–1076
+─────────────────────────── ──────────────   ─────────────────────────────────
+Output (guardrailed)        ≤ 200           MAX_OUTPUT_CHARS=800 ÷ ~4 chars/token
+```
+
+### Why context budgets were tightened (Phase 4)
+
+The MCP guardrail constants were reduced in Phase 4 specifically to reduce the second model call latency:
+
+```
+Phase 3 → Phase 4
+MAX_RESULTS:      5  →  3     (-40% search payload)
+MAX_SNIPPET_LEN:  300 → 200   (-33% per snippet)
+MAX_TOTAL_CHARS:  1500 → 800  (-47% tool context)
+```
+
+Benchmark observation: large tool context was the #2 latency contributor after raw Ollama inference time. Smaller context → faster tokenisation and prefill → measurable reduction in second-pass latency.
+
+### Reflection prompt
+
+The `REFLECTION_PROMPT` is a separate system prompt used only by `reflection_node`. It instructs the model to output a strict JSON array of insight objects — a structured output contract that avoids free-form parsing:
+
+```python
+REFLECTION_PROMPT = """You are the inner consciousness of SAM.
+...
+Output ONLY a JSON list:
+[{"fact": "...", "type": "mood|interest|bio|goal", "confidence": 0.0-1.0}]
+If nothing new learned, return empty list []."""
+```
+
+The strict JSON contract means `reflection_node` can call `json.loads()` directly on the model output rather than parsing prose — reducing the surface area for hallucination.
+
+---
+
+## 24. Performance Profile
+
+Latency numbers observed during live testing (`phi3:latest` on CPU, Docker on Windows host).
+
+### Node latency breakdown
+
+| Node | Typical duration | Bottleneck? |
+|------|-----------------|-------------|
+| `router_node` | < 1 ms | No |
+| `state_init_node` | < 1 ms | No |
+| `decision_logic_node` | < 1 ms | No |
+| `task_preprocessing_node` | < 1 ms | No |
+| `memory_access_decision_node` | < 1 ms | No (regex, no I/O) |
+| `fact_extraction_node` | < 5 ms | No (regex) |
+| `write_authorization_node` | < 1 ms | No |
+| `memory_read_node` (SQLite) | 1–10 ms | No |
+| `long_term_memory_read_node` (Qdrant) | 10–30 ms | Minor (network) |
+| `tool_execution_node` (web search) | 2,000–8,000 ms | **Yes** — network + provider latency |
+| `model_call_node` (Ollama phi3, CPU) | 8,000–30,000 ms | **Yes — primary bottleneck** |
+| `memory_write_node` (SQLite) | 5–15 ms | No |
+| `long_term_memory_write_node` (Qdrant) | 50–200 ms | Minor |
+| `format_response_node` | < 1 ms | No |
+
+### Total request latency — typical paths
+
+```
+Path                                    Typical wall time
+─────────────────────────────────────── ─────────────────
+Text message, no tool (simple query)    10–30 s
+Text message + web search               20–45 s
+Voice message (Whisper base, CPU)       +3–8 s for STT
+```
+
+The HTTP 200 is returned to Telegram **before** this work begins (background task). The user receives the reply after the full latency, but Telegram does not time out because the 200 was already sent.
+
+### Background reflection latency
+
+```
+Reflection fires 5s after reply is sent
+Ollama call for insight extraction:  8–20 s
+Qdrant write (2 facts):              ~100 ms
+Total reflection cycle:              ~13–25 s
+```
+
+Reflection runs entirely in the background and does not affect the user-facing response time.
+
+### Reducing latency
+
+| Strategy | Impact | Trade-off |
+|---------|--------|-----------|
+| Use GPU for Ollama (`WHISPER_DEVICE=cuda`) | 5–10× faster model calls | Requires CUDA 12.1+, GPU Docker |
+| Use a smaller model (`tiny`, `phi` instead of `phi3`) | 2–3× faster | Lower response quality |
+| Disable LTM read (`LTM_BACKEND=stub`) | Save 10–30 ms per turn | No cross-session memory |
+| Reduce `OLLAMA_KEEP_ALIVE` to 0 | Not recommended — increases cold-start latency | — |
+| Set `OLLAMA_KEEP_ALIVE=24h` (default) | Model stays loaded, eliminates cold-start | Memory usage |
+| Reduce freshness keyword set | Fewer forced tool calls | May miss real-time queries |
+
+### Concurrency model
+
+SAM is currently a **single-threaded async server** with a **single Ollama instance**:
+
+- FastAPI (uvicorn) handles concurrent HTTP connections on one event loop
+- LLM calls (`model_call_node`) block the event loop until `ainvoke` completes
+- Concurrent Telegram messages queue behind the active LLM call
+- Rate limiting (3 req/5s/user) bounds the queue growth
+
+For personal-assistant scale (one primary user, occasional concurrent messages) this is acceptable. For multi-user scale, a message queue (Redis + Celery) in front of the agent would decouple webhook receipt from LLM processing.
+
+---
+
+## 25. Security Model
+
+### What is protected
+
+| Surface | Mechanism | Implementation |
+|---------|-----------|---------------|
+| WhatsApp webhook authenticity | HMAC-SHA256 signature verification | `transport/whatsapp/security.py` |
+| Telegram update deduplication | TTLCache on `update_id` (5000 entries, 5 min TTL) | `webhook/telegram.py` |
+| Telegram flood protection | Per-user rate limit (3 req / 5 s) | `webhook/telegram.py` |
+| CORS origin restriction | `ALLOWED_ORIGINS` env var (default `*` for dev) | `agent/api.py`, `main.py` |
+| Debug endpoint access | `X-Debug-Token` header (when `DEBUG_API_TOKEN` set) | `agent/api.py` |
+| SQLite data durability | WAL mode + `PRAGMA synchronous=FULL` | `agent/memory/sqlite.py` |
+| LTM data integrity | Qdrant append-only — no updates or deletes | `agent/memory/long_term_qdrant.py` |
+| Credential isolation | All API keys in `.env` (gitignored); never logged or stored in state | `.gitignore`, `agent/mcp/external_client.py` |
+| Non-root container user | `agent` user, uid=1000 | `docker/Dockerfile.agent` |
+| Tool call injection | `MCPGuardrails.sanitize_results()` validates URLs (`startswith("http")`) | `agent/mcp/guardrails.py` |
+
+### What is NOT protected (known gaps)
+
+| Surface | Risk | Mitigation |
+|---------|------|-----------|
+| `/invoke` endpoint | No authentication — any caller can invoke the agent directly | Add API key auth if exposing publicly; currently protected by ngrok being the only entry point |
+| `/health/*` endpoints | Publicly readable — reveals backend configuration | Low risk; set `ALLOWED_ORIGINS` if needed |
+| Telegram bot token | If leaked, anyone can impersonate the bot or read messages | Rotate immediately via @BotFather; token is gitignored |
+| ngrok URL | If the static domain is known, anyone can POST to the webhook | Telegram validates that updates come from Telegram servers; non-Telegram POSTs are handled gracefully |
+| Ollama API | Exposed only on internal Docker network (not mapped to host) | Safe as long as Docker network is not bridged to untrusted networks |
+| Qdrant API | Exposed on host port 6333 if Docker is running | Set `QDRANT_API_KEY` or firewall the port in production |
+
+### Prompt injection surface
+
+The user's message is injected into the model prompt as-is. A crafted message could attempt to override the system prompt or inject tool call syntax. Current mitigations:
+
+- `MAX_OUTPUT_CHARS = 800` limits any amplified output
+- `MAX_TOOL_CALLS_PER_TURN = 1` prevents cascading tool abuse
+- `MCPGuardrails.check_tool_call_limit()` is checked in both `decision_logic_node` and `tool_execution_node` (belt + suspenders)
+- Tool results are sanitised before injection (`sanitize_results()`)
+
+### Secrets handling
+
+```
+.env                 → gitignored, never committed
+Config.TELEGRAM_BOT_TOKEN  → never appears in logs
+MCP API keys         → never stored in AgentState
+LangSmith API key    → passed as env var to container, not logged
+```
+
+The `agent/mcp/external_client.py` docstring explicitly states: *"Credentials never logged or stored in state."*
+
+---
+
+## 26. Local Development & Troubleshooting
+
+### Running without Docker
+
+For fast iteration on agent logic without building images:
+
+```bash
+# 1. Install dependencies (requires uv)
+pip install uv
+uv sync
+
+# or with pip directly:
+pip install -e ".[dev]"
+
+# 2. Set up minimal environment
+export TELEGRAM_BOT_TOKEN=your-token
+export LLM_BACKEND=stub          # no Ollama needed
+export STM_BACKEND=sqlite
+export LTM_BACKEND=stub          # no Qdrant needed
+export STT_ENABLED=false
+export TTS_ENABLED=false
+export TRACER_BACKEND=noop
+export SQLITE_DB_PATH=./dev.db
+
+# 3. Run the development server
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# or the production entry point:
+python -m agent.api --port 8000
+```
+
+### Running a single service locally
+
+```bash
+# Ollama only (if you want a real LLM without full Docker)
+docker run -p 11434:11434 -v ollama_data:/var/lib/ollama ollama/ollama
+docker exec <container> ollama pull phi3
+
+# Qdrant only
+docker run -p 6333:6333 -v qdrant_data:/qdrant/storage qdrant/qdrant
+```
+
+### Windows-specific notes
+
+```powershell
+# Set env vars in PowerShell
+$env:TELEGRAM_BOT_TOKEN = "your-token"
+$env:LLM_BACKEND = "stub"
+
+# Run tests
+python -m pytest tests/unit/ -v --tb=short
+
+# Line endings: git is configured for CRLF on Windows.
+# LF↔CRLF warnings on git operations are expected and harmless.
+# To suppress them globally:
+git config --global core.autocrlf true
+```
+
+### Running the test suite
+
+```bash
+# Fastest — unit tests only (no services, ~3s)
+pytest tests/unit/ -v --tb=short
+
+# Integration tests (stub backends, no services, ~10s)
+LLM_BACKEND=stub STM_BACKEND=sqlite LTM_BACKEND=stub \
+STT_ENABLED=false TTS_ENABLED=false TRACER_BACKEND=noop \
+TELEGRAM_BOT_TOKEN=test-token SQLITE_DB_PATH=:memory: \
+pytest tests/integration/ -v --tb=short
+
+# Specific test category
+pytest tests/observability/ -v       # tracing invariants
+pytest tests/mcp/ -v                 # tool guardrails
+pytest tests/transport/ -v           # webhook contracts
+```
+
+---
+
+### Troubleshooting
+
+#### `/health/ready` returns `unhealthy` — `No module named 'opentelemetry'`
+
+**Cause:** A top-level import of `otel_tracer.py` forces `opentelemetry` to load even when `TRACER_BACKEND=langsmith`.
+
+**Fix:** This was resolved in commit `feeaa08` by removing the dead `OtelTracer` import from `langgraph_orchestrator.py`. If you see this error on an older build, rebuild the image.
+
+---
+
+#### Telegram webhook always returns errors — `pending_update_count` stays > 0
+
+**Cause:** ngrok tunnel is down.
+
+**Fix:**
+```bash
+./ngrok http 8000 --domain=YOUR-STATIC-DOMAIN.ngrok-free.app
+# No Telegram re-registration needed if using a static domain.
+curl http://localhost:8000/webhook/telegram/webhook-info
+# → pending_update_count should drop to 0
+```
+
+---
+
+#### Agent crashes on all Telegram messages — `cannot pickle '_thread.lock'`
+
+**Cause:** `dataclasses.asdict(state)` inside `_wrap_node_execution` deepcopies `AgentExecutionContext.telemetry_emitter` (the LangSmith tracer), which contains `threading.Lock` objects.
+
+**Fix:** Resolved in commit `feeaa08`:
+- `_snapshot()` function now skips `execution_context` before deepcopying
+- `__deepcopy__` added to `AgentExecutionContext`
+- `graph.invoke()` → `await graph.ainvoke()` across all async call sites
+
+---
+
+#### Duplicate log lines — every agent log appears twice
+
+**Cause:** The `agent` namespace logger had a `StreamHandler` added while `propagate=True` allowed records to also reach the root handler.
+
+**Fix:** `agent_logger.propagate = False` in `agent/logging_config.py`. Resolved in commit `feeaa08`.
+
+---
+
+#### Ollama returns `model not found`
+
+```bash
+# List available models in the container
+docker exec sam-agent-ollama ollama list
+
+# Pull the configured model
+docker exec sam-agent-ollama ollama pull phi3
+
+# Verify OLLAMA_MODEL in your .env matches the pulled model name exactly
+grep OLLAMA_MODEL .env
+```
+
+---
+
+#### Qdrant LTM writes fail silently
+
+**Cause:** Qdrant container not running, or the collection doesn't exist yet.
+
+**Fix:**
+```bash
+# Check Qdrant health
+curl http://localhost:6333/healthz
+
+# The collection is created automatically on first write.
+# If it fails, check logs:
+docker logs sam-agent-qdrant --tail=50
+docker logs sam-agent --tail=50 | grep -i qdrant
+```
+
+---
+
+#### STT fails — voice messages not transcribed
+
+**Cause:** Whisper model not downloaded, or `STT_ENABLED=false`.
+
+**Fix:**
+```bash
+# Verify STT is enabled
+grep STT_ENABLED .env   # should be "true"
+
+# Whisper downloads on first use — check for download errors:
+docker logs sam-agent --tail=100 | grep -i whisper
+
+# If CUDA errors: set WHISPER_DEVICE=cpu in .env
+```
+
+---
+
+#### Agent /health/ready fails — `agent_logic_ok: false`
+
+**Cause:** A broken import somewhere in `agent/orchestrator.py` import chain.
+
+**Debug steps:**
+```bash
+# Enter the container and test imports manually
+docker exec -it sam-agent python -c "from agent.orchestrator import SAMOrchestrator; print('OK')"
+
+# If import fails, read the full traceback:
+docker exec -it sam-agent python -c "
+import traceback
+try:
+    from agent.orchestrator import SAMOrchestrator
+except Exception:
+    traceback.print_exc()
+"
 ```
 
 ---
