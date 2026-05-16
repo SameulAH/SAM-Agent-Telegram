@@ -43,7 +43,6 @@ The system is explicitly designed for **operational reliability over capability 
 27. [Model Selection Guide](#27-model-selection-guide)
 28. [Evaluation Framework](#28-evaluation-framework)
 29. [Data Privacy & Retention](#29-data-privacy--retention)
-30. [Backup & Recovery](#30-backup--recovery)
 
 ---
 
@@ -1911,67 +1910,6 @@ SAM stores two categories of user data. Understanding the storage contract matte
 - Reflection insights are typed (`mood`, `interest`, `bio`, `goal`) — not free-form verbatim copies of messages
 - LangSmith can be disabled entirely by setting `TRACER_BACKEND=noop`
 
----
-
-## 30. Backup & Recovery
-
-### SQLite — Short-Term Memory
-
-SQLite with `PRAGMA journal_mode=WAL` supports **online backup** without locking the database:
-
-```bash
-# Live backup (safe while agent is running — WAL mode supports this)
-docker exec sam-agent sqlite3 /app/data/memory.db \
-  ".backup /app/data/memory.db.bak"
-
-# Or copy the volume directly (requires brief agent pause for consistency)
-docker stop sam-agent
-docker run --rm \
-  -v sam-agent-telegram_sqlite_data:/data \
-  -v $(pwd)/backups:/backup \
-  alpine tar czf /backup/sqlite_$(date +%Y%m%d).tar.gz /data
-docker start sam-agent
-
-# Restore
-docker stop sam-agent
-docker run --rm \
-  -v sam-agent-telegram_sqlite_data:/data \
-  -v $(pwd)/backups:/backup \
-  alpine sh -c "cd / && tar xzf /backup/sqlite_YYYYMMDD.tar.gz"
-docker start sam-agent
-```
-
-### Qdrant — Long-Term Memory
-
-Qdrant exposes a **snapshot API** for consistent collection backups:
-
-```bash
-# Create a snapshot of the LTM collection
-curl -X POST http://localhost:6333/collections/long_term_memory/snapshots
-
-# List available snapshots
-curl http://localhost:6333/collections/long_term_memory/snapshots
-
-# Download a snapshot (replace SNAPSHOT_NAME with the returned name)
-curl -o ltm_backup.tar \
-  "http://localhost:6333/collections/long_term_memory/snapshots/SNAPSHOT_NAME"
-
-# Restore a snapshot to a (possibly empty) Qdrant instance
-curl -X POST "http://localhost:6333/collections/long_term_memory/snapshots/upload" \
-  -H "Content-Type: multipart/form-data" \
-  -F "snapshot=@ltm_backup.tar"
-```
-
-### Automated daily backup (cron example)
-
-```bash
-# Add to host crontab: crontab -e
-# Runs at 02:00 daily — backs up both SQLite and Qdrant snapshot
-
-0 2 * * * docker exec sam-agent sqlite3 /app/data/memory.db ".backup /app/data/memory_$(date +\%Y\%m\%d).db" && \
-          curl -s -X POST http://localhost:6333/collections/long_term_memory/snapshots > /dev/null && \
-          echo "[$(date)] Backup complete" >> /var/log/sam-backup.log
-```
 ---
 
 ## Licence
